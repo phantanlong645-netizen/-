@@ -6,6 +6,8 @@ import (
 	"github.com/spf13/viper"
 )
 
+var Conf Config
+
 type Config struct {
 	Server        ServerConfig        `mapstructure:"server"`
 	Database      DatabaseConfig      `mapstructure:"database"`
@@ -19,7 +21,7 @@ type Config struct {
 }
 
 type ServerConfig struct {
-	Port int    `mapstructure:"port"`
+	Port string `mapstructure:"port"`
 	Mode string `mapstructure:"mode"`
 }
 
@@ -81,18 +83,15 @@ type EmbeddingConfig struct {
 	Dimensions int    `mapstructure:"dimensions"`
 }
 
-func Load(configPath string) (*Config, error) {
+func Init(configPath string) {
 	viper.SetConfigFile(configPath)
 	viper.SetConfigType("yaml")
 
 	if err := viper.ReadInConfig(); err != nil {
-		return nil, fmt.Errorf("failed to read config: %w", err)
+		panic(fmt.Errorf("读取配置文件失败: %w", err))
 	}
 
-	var cfg Config
-	if err := viper.Unmarshal(&cfg); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal config: %w", err)
+	if err := viper.Unmarshal(&Conf); err != nil {
+		panic(fmt.Errorf("无法将配置解析到结构体中: %w", err))
 	}
-
-	return &cfg, nil
 }

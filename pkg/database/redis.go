@@ -1,31 +1,25 @@
 package database
 
 import (
+	"RAG-repository/pkg/log"
 	"context"
-	"fmt"
-	"time"
 
 	"github.com/redis/go-redis/v9"
 )
 
-func NewRedis(addr, password string, db int) (*redis.Client, error) {
-	client := redis.NewClient(&redis.Options{
-		Addr:         addr,
-		Password:     password,
-		DB:           db,
-		DialTimeout:  5 * time.Second,
-		ReadTimeout:  3 * time.Second,
-		WriteTimeout: 3 * time.Second,
-		PoolSize:     100,
-		MinIdleConns: 10,
+var RDB *redis.Client
+
+func InitRedis(addr, password string, db int) {
+	RDB = redis.NewClient(&redis.Options{
+		Addr:     addr,
+		Password: password,
+		DB:       db,
 	})
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	if err := client.Ping(ctx).Err(); err != nil {
-		return nil, fmt.Errorf("failed to connect to redis: %w", err)
+	ctx := context.Background()
+	if err := RDB.Ping(ctx).Err(); err != nil {
+		log.Fatal("failed to connect to redis", err)
 	}
 
-	return client, nil
+	log.Info("Redis client connected successfully")
 }

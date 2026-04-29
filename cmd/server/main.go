@@ -1,0 +1,66 @@
+package main
+
+import (
+	"RAG-repository/internal/config"
+	"RAG-repository/pkg/database"
+	"RAG-repository/pkg/es"
+	"RAG-repository/pkg/kafka"
+	"RAG-repository/pkg/log"
+	"RAG-repository/pkg/storage"
+	"fmt"
+	"os"
+	"os/signal"
+	"syscall"
+
+	"github.com/gin-gonic/gin"
+)
+
+func main() {
+	config.Init("./config/config.yaml")
+	cfg := config.Conf
+
+	log.Init(cfg.Log.Level, cfg.Log.Format, cfg.Log.OutputPath)
+	defer log.Sync()
+	log.Info("log initialized successfully")
+
+	database.InitMySQL(cfg.Database.MySQL.DSN)
+	database.InitRedis(cfg.Database.Redis.Addr, cfg.Database.Redis.Password, cfg.Database.Redis.DB)
+	storage.InitMinIO(cfg.MinIO)
+	if err := es.InitES(cfg.Elasticsearch); err != nil {
+		log.Errorf("es 初始化失败 %s", err)
+		return
+	}
+	kafka.InitProducer(cfg.Kafka)
+
+	if cfg.Server.Mode == "release" {
+		gin.SetMode(gin.ReleaseMode)
+	}
+	router := gin.Default()
+
+	registerRoutes(router)
+
+	serverAddr := fmt.Sprintf(":%s", cfg.Server.Port)
+	log.Infof("Server starting on %s", serverAddr)
+
+	go func() {
+		if err := router.Run(serverAddr); err != nil {
+			log.Fatalf("Failed to start server: %v", err)
+		}
+	}()
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+
+	log.Info("Shutting down server...")
+}
+
+func registerRoutes(r *gin.Engine) {
+	r.GET("/health", func(c *gin.Context) {
+		c.JSON(200, gin.H{"status": "ok"})
+	})
+
+	r.GET("/", func(c *gin.Context) {
+		c.JSON(200, gin.H{"message": "Welcome to RAG-repository API"})
+	})
+}
