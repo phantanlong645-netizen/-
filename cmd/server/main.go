@@ -3,10 +3,14 @@ package main
 import (
 	"RAG-repository/internal/config"
 	"RAG-repository/pkg/database"
+	"RAG-repository/pkg/embedding"
 	"RAG-repository/pkg/es"
 	"RAG-repository/pkg/kafka"
+	"RAG-repository/pkg/llm"
 	"RAG-repository/pkg/log"
 	"RAG-repository/pkg/storage"
+	"RAG-repository/pkg/tika"
+	"RAG-repository/pkg/token"
 	"fmt"
 	"os"
 	"os/signal"
@@ -31,6 +35,18 @@ func main() {
 		return
 	}
 	kafka.InitProducer(cfg.Kafka)
+	tikaClient := tika.NewClient(cfg.Tika)
+	embeddingClient := embedding.NewClient(cfg.Embedding)
+	_ = tikaClient
+	_ = embeddingClient
+	llmClient := llm.NewClient(cfg.LLM)
+	_ = llmClient
+	jwtManager := token.NewJWTManager(
+		cfg.JWT.Secret,
+		cfg.JWT.AccessTokenExpireHours,
+		cfg.JWT.RefreshTokenExpireDays,
+	)
+	_ = jwtManager
 
 	if cfg.Server.Mode == "release" {
 		gin.SetMode(gin.ReleaseMode)

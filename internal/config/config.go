@@ -18,6 +18,27 @@ type Config struct {
 	Tika          TikaConfig          `mapstructure:"tika"`
 	Elasticsearch ElasticsearchConfig `mapstructure:"elasticsearch"`
 	Embedding     EmbeddingConfig     `mapstructure:"embedding"`
+	LLM           LLMConfig           `mapstructure:"llm"`
+}
+type LLMConfig struct {
+	APIKey     string              `mapstructure:"api_key"`
+	BaseURL    string              `mapstructure:"base_url"`
+	Model      string              `mapstructure:"model"`
+	Generation LLMGenerationConfig `mapstructure:"generation"`
+	Prompt     LLMPromptConfig     `mapstructure:"prompt"`
+}
+
+type LLMGenerationConfig struct {
+	Temperature float64 `mapstructure:"temperature"`
+	TopP        float64 `mapstructure:"top_p"`
+	MaxTokens   int     `mapstructure:"max_tokens"`
+}
+
+type LLMPromptConfig struct {
+	Rules        string `mapstructure:"rules"`
+	RefStart     string `mapstructure:"ref_start"`
+	RefEnd       string `mapstructure:"ref_end"`
+	NoResultText string `mapstructure:"no_result_text"`
 }
 
 type ServerConfig struct {
