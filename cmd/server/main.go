@@ -2,6 +2,7 @@ package main
 
 import (
 	"RAG-repository/internal/config"
+	"RAG-repository/internal/repository"
 	"RAG-repository/pkg/database"
 	"RAG-repository/pkg/embedding"
 	"RAG-repository/pkg/es"
@@ -47,6 +48,10 @@ func main() {
 		cfg.JWT.RefreshTokenExpireDays,
 	)
 	_ = jwtManager
+	userRepository := repository.NewUserRepository(database.DB)
+	orgTagRepo := repository.NewOrgTagRepository(database.DB)
+	_ = userRepository
+	_ = orgTagRepo
 
 	if cfg.Server.Mode == "release" {
 		gin.SetMode(gin.ReleaseMode)
