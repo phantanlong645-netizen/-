@@ -50,8 +50,14 @@ func main() {
 	_ = jwtManager
 	userRepository := repository.NewUserRepository(database.DB)
 	orgTagRepo := repository.NewOrgTagRepository(database.DB)
+	uploadRepo := repository.NewUploadRepository(database.DB, database.RDB)
+	conversationRepo := repository.NewConversationRepository(database.RDB)
+	docVectorRepo := repository.NewDocumentVectorRepository(database.DB)
 	_ = userRepository
 	_ = orgTagRepo
+	_ = uploadRepo
+	_ = conversationRepo
+	_ = docVectorRepo
 
 	if cfg.Server.Mode == "release" {
 		gin.SetMode(gin.ReleaseMode)
