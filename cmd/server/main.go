@@ -3,6 +3,7 @@ package main
 import (
 	"RAG-repository/internal/config"
 	"RAG-repository/internal/repository"
+	"RAG-repository/internal/service"
 	"RAG-repository/pkg/database"
 	"RAG-repository/pkg/embedding"
 	"RAG-repository/pkg/es"
@@ -58,6 +59,11 @@ func main() {
 	_ = uploadRepo
 	_ = conversationRepo
 	_ = docVectorRepo
+	userService := service.NewUserService(userRepository, orgTagRepo, jwtManager)
+	adminService := service.NewAdminService(orgTagRepo, userRepository, conversationRepo)
+
+	_ = userService
+	_ = adminService
 
 	if cfg.Server.Mode == "release" {
 		gin.SetMode(gin.ReleaseMode)
