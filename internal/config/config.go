@@ -19,6 +19,7 @@ type Config struct {
 	Elasticsearch ElasticsearchConfig `mapstructure:"elasticsearch"`
 	Embedding     EmbeddingConfig     `mapstructure:"embedding"`
 	LLM           LLMConfig           `mapstructure:"llm"`
+	AI            AIConfig            `mapstructure:"ai"`
 }
 type LLMConfig struct {
 	APIKey     string              `mapstructure:"api_key"`
@@ -39,6 +40,24 @@ type LLMPromptConfig struct {
 	RefStart     string `mapstructure:"ref_start"`
 	RefEnd       string `mapstructure:"ref_end"`
 	NoResultText string `mapstructure:"no_result_text"`
+}
+
+type AIConfig struct {
+	Generation AIGenerationConfig `mapstructure:"generation"`
+	Prompt     AIPromptConfig     `mapstructure:"prompt"`
+}
+
+type AIGenerationConfig struct {
+	Temperature float64 `mapstructure:"temperature"`
+	TopP        float64 `mapstructure:"top-p"`
+	MaxTokens   int     `mapstructure:"max-tokens"`
+}
+
+type AIPromptConfig struct {
+	Rules        string `mapstructure:"rules"`
+	RefStart     string `mapstructure:"ref-start"`
+	RefEnd       string `mapstructure:"ref-end"`
+	NoResultText string `mapstructure:"no-result-text"`
 }
 
 type ServerConfig struct {
