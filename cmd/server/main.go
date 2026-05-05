@@ -2,6 +2,7 @@ package main
 
 import (
 	"RAG-repository/internal/config"
+	"RAG-repository/internal/pipeline"
 	"RAG-repository/internal/repository"
 	"RAG-repository/internal/service"
 	"RAG-repository/pkg/database"
@@ -61,9 +62,29 @@ func main() {
 	_ = docVectorRepo
 	userService := service.NewUserService(userRepository, orgTagRepo, jwtManager)
 	adminService := service.NewAdminService(orgTagRepo, userRepository, conversationRepo)
+	uploadService := service.NewUploadService(uploadRepo, userRepository, cfg.MinIO)
+	documentService := service.NewDocumentService(uploadRepo, userRepository, orgTagRepo, cfg.MinIO, tikaClient)
+	searchService := service.NewSearchService(embeddingClient, es.ESClient, userService, uploadRepo)
+	conversationService := service.NewConversationService(conversationRepo)
+	chatService := service.NewChatService(searchService, llmClient, conversationRepo)
+	processor := pipeline.NewProcessor(
+		tikaClient,
+		embeddingClient,
+		cfg.Elasticsearch,
+		cfg.MinIO,
+		cfg.Embedding,
+		uploadRepo,
+		docVectorRepo,
+	)
+
+	go kafka.StartConsumer(cfg.Kafka, processor)
 
 	_ = userService
 	_ = adminService
+	_ = uploadService
+	_ = documentService
+	_ = conversationService
+	_ = chatService
 
 	if cfg.Server.Mode == "release" {
 		gin.SetMode(gin.ReleaseMode)
