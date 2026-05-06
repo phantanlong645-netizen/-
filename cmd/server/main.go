@@ -2,6 +2,8 @@ package main
 
 import (
 	"RAG-repository/internal/config"
+	"RAG-repository/internal/handler"
+	"RAG-repository/internal/middleware"
 	"RAG-repository/internal/pipeline"
 	"RAG-repository/internal/repository"
 	"RAG-repository/internal/service"
@@ -79,10 +81,7 @@ func main() {
 
 	go kafka.StartConsumer(cfg.Kafka, processor)
 
-	_ = userService
 	_ = adminService
-	_ = uploadService
-	_ = documentService
 	_ = conversationService
 	_ = chatService
 
@@ -91,7 +90,7 @@ func main() {
 	}
 	router := gin.Default()
 
-	registerRoutes(router)
+	registerRoutes(router, userService, uploadService, documentService, jwtManager)
 
 	serverAddr := fmt.Sprintf(":%s", cfg.Server.Port)
 	log.Infof("Server starting on %s", serverAddr)
@@ -108,8 +107,13 @@ func main() {
 
 	log.Info("Shutting down server...")
 }
-
-func registerRoutes(r *gin.Engine) {
+func registerRoutes(
+	r *gin.Engine,
+	userService service.UserService,
+	uploadService service.UploadService,
+	documentService service.DocumentService,
+	jwtManager *token.JWTManager,
+) {
 	r.GET("/health", func(c *gin.Context) {
 		c.JSON(200, gin.H{"status": "ok"})
 	})
@@ -117,4 +121,49 @@ func registerRoutes(r *gin.Engine) {
 	r.GET("/", func(c *gin.Context) {
 		c.JSON(200, gin.H{"message": "Welcome to RAG-repository API"})
 	})
+
+	apiV1 := r.Group("/api/v1")
+	{
+		auth := apiV1.Group("/auth")
+		{
+			auth.POST("/refreshToken", handler.NewAuthHandler(userService).RefreshToken)
+		}
+
+		users := apiV1.Group("/users")
+		{
+			users.POST("/register", handler.NewUserHandler(userService).Register)
+			users.POST("/login", handler.NewUserHandler(userService).Login)
+
+			authed := users.Group("/")
+			authed.Use(middleware.AuthMiddleware(jwtManager, userService))
+			{
+				authed.GET("/me", handler.NewUserHandler(userService).GetProfile)
+				authed.POST("/logout", handler.NewUserHandler(userService).Logout)
+				authed.PUT("/primary-org", handler.NewUserHandler(userService).SetPrimaryOrg)
+				authed.GET("/org-tags", handler.NewUserHandler(userService).GetUserOrgTags)
+			}
+		}
+
+		upload := apiV1.Group("/upload")
+		upload.Use(middleware.AuthMiddleware(jwtManager, userService))
+		{
+			upload.POST("/check", handler.NewUploadHandler(uploadService).CheckFile)
+			upload.POST("/chunk", handler.NewUploadHandler(uploadService).UploadChunk)
+			upload.POST("/merge", handler.NewUploadHandler(uploadService).MergeChunks)
+			upload.GET("/status", handler.NewUploadHandler(uploadService).GetUploadStatus)
+			upload.GET("/supported-types", handler.NewUploadHandler(uploadService).GetSupportedFileTypes)
+			upload.POST("/fast-upload", handler.NewUploadHandler(uploadService).FastUpload)
+		}
+
+		documents := apiV1.Group("/documents")
+		documents.Use(middleware.AuthMiddleware(jwtManager, userService))
+		{
+			documents.GET("/accessible", handler.NewDocumentHandler(documentService, userService).ListAccessibleFiles)
+			documents.GET("/uploads", handler.NewDocumentHandler(documentService, userService).ListUploadedFiles)
+			documents.DELETE("/:fileMd5", handler.NewDocumentHandler(documentService, userService).DeleteDocument)
+			documents.GET("/download", handler.NewDocumentHandler(documentService, userService).GenerateDownloadURL)
+			documents.GET("/preview", handler.NewDocumentHandler(documentService, userService).PreviewFile)
+		}
+
+	}
 }
