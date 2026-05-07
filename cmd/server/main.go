@@ -82,7 +82,6 @@ func main() {
 	go kafka.StartConsumer(cfg.Kafka, processor)
 
 	_ = adminService
-	_ = conversationService
 	_ = chatService
 
 	if cfg.Server.Mode == "release" {
@@ -90,7 +89,7 @@ func main() {
 	}
 	router := gin.Default()
 
-	registerRoutes(router, userService, uploadService, documentService, searchService, jwtManager)
+	registerRoutes(router, userService, uploadService, documentService, searchService, conversationService, chatService, jwtManager)
 
 	serverAddr := fmt.Sprintf(":%s", cfg.Server.Port)
 	log.Infof("Server starting on %s", serverAddr)
@@ -113,6 +112,8 @@ func registerRoutes(
 	uploadService service.UploadService,
 	documentService service.DocumentService,
 	searchService service.SearchService,
+	conversationService service.ConversationService,
+	chatService service.ChatService,
 	jwtManager *token.JWTManager,
 ) {
 	r.GET("/health", func(c *gin.Context) {
@@ -171,6 +172,19 @@ func registerRoutes(
 		{
 			search.GET("/hybrid", handler.NewSearchHandler(searchService).HybridSearch)
 		}
+
+		conversation := apiV1.Group("/users/conversation")
+		conversation.Use(middleware.AuthMiddleware(jwtManager, userService))
+		{
+			conversation.GET("", handler.NewConversationHandler(conversationService).GetConversations)
+		}
+
+		chatGroup := apiV1.Group("/chat")
+		{
+			chatGroup.GET("/websocket-token", handler.NewChatHandler(chatService, userService, jwtManager).GetWebsocketStopToken)
+		}
+
+		r.GET("/chat/:token", handler.NewChatHandler(chatService, userService, jwtManager).Handle)
 
 	}
 }
