@@ -90,7 +90,7 @@ func main() {
 	}
 	router := gin.Default()
 
-	registerRoutes(router, userService, uploadService, documentService, jwtManager)
+	registerRoutes(router, userService, uploadService, documentService, searchService, jwtManager)
 
 	serverAddr := fmt.Sprintf(":%s", cfg.Server.Port)
 	log.Infof("Server starting on %s", serverAddr)
@@ -112,6 +112,7 @@ func registerRoutes(
 	userService service.UserService,
 	uploadService service.UploadService,
 	documentService service.DocumentService,
+	searchService service.SearchService,
 	jwtManager *token.JWTManager,
 ) {
 	r.GET("/health", func(c *gin.Context) {
@@ -163,6 +164,12 @@ func registerRoutes(
 			documents.DELETE("/:fileMd5", handler.NewDocumentHandler(documentService, userService).DeleteDocument)
 			documents.GET("/download", handler.NewDocumentHandler(documentService, userService).GenerateDownloadURL)
 			documents.GET("/preview", handler.NewDocumentHandler(documentService, userService).PreviewFile)
+		}
+
+		search := apiV1.Group("/search")
+		search.Use(middleware.AuthMiddleware(jwtManager, userService))
+		{
+			search.GET("/hybrid", handler.NewSearchHandler(searchService).HybridSearch)
 		}
 
 	}
