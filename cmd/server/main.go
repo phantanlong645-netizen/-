@@ -81,15 +81,13 @@ func main() {
 
 	go kafka.StartConsumer(cfg.Kafka, processor)
 
-	_ = adminService
-	_ = chatService
-
 	if cfg.Server.Mode == "release" {
 		gin.SetMode(gin.ReleaseMode)
 	}
-	router := gin.Default()
+	router := gin.New()
+	router.Use(middleware.RequestLogger(), gin.Recovery())
 
-	registerRoutes(router, userService, uploadService, documentService, searchService, conversationService, chatService, jwtManager)
+	registerRoutes(router, userService, adminService, uploadService, documentService, searchService, conversationService, chatService, jwtManager)
 
 	serverAddr := fmt.Sprintf(":%s", cfg.Server.Port)
 	log.Infof("Server starting on %s", serverAddr)
@@ -109,6 +107,7 @@ func main() {
 func registerRoutes(
 	r *gin.Engine,
 	userService service.UserService,
+	adminService service.AdminService,
 	uploadService service.UploadService,
 	documentService service.DocumentService,
 	searchService service.SearchService,
@@ -185,6 +184,23 @@ func registerRoutes(
 		}
 
 		r.GET("/chat/:token", handler.NewChatHandler(chatService, userService, jwtManager).Handle)
+
+		admin := apiV1.Group("/admin")
+		admin.Use(middleware.AuthMiddleware(jwtManager, userService), middleware.AdminAuthMiddleware())
+		{
+			admin.GET("/users/list", handler.NewAdminHandler(adminService, userService).ListUsers)
+			admin.PUT("/users/:userId/org-tags", handler.NewAdminHandler(adminService, userService).AssignOrgTagsToUser)
+			admin.GET("/conversation", handler.NewAdminHandler(adminService, userService).GetAllConversations)
+
+			orgTags := admin.Group("/org-tags")
+			{
+				orgTags.POST("", handler.NewAdminHandler(adminService, userService).CreateOrganizationTag)
+				orgTags.GET("", handler.NewAdminHandler(adminService, userService).ListOrganizationTags)
+				orgTags.GET("/tree", handler.NewAdminHandler(adminService, userService).GetOrganizationTagTree)
+				orgTags.PUT("/:id", handler.NewAdminHandler(adminService, userService).UpdateOrganizationTag)
+				orgTags.DELETE("/:id", handler.NewAdminHandler(adminService, userService).DeleteOrganizationTag)
+			}
+		}
 
 	}
 }
