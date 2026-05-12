@@ -11,6 +11,7 @@ import (
 
 	"RAG-repository/internal/config"
 	"RAG-repository/internal/repository"
+	"RAG-repository/internal/storagepath"
 	"RAG-repository/pkg/embedding"
 	"RAG-repository/pkg/log"
 	"RAG-repository/pkg/storage"
@@ -53,7 +54,7 @@ func NewProcessor(
 func (p *Processor) Process(ctx context.Context, task tasks.FileProcessingTask) error {
 	log.Infof("[Processor] 开始处理文件, FileMD5: %s, FileName: %s, UserID: %d", task.FileMD5, task.FileName, task.UserID)
 
-	objectName := fmt.Sprintf("merged/%s", task.FileName)
+	objectName := storagepath.MergedObjectName(task.UserID, task.FileMD5, task.FileName)
 	log.Infof("[Processor] 步骤1: 从MinIO下载文件, Bucket: %s, Object: %s", p.minioCfg.BucketName, objectName)
 
 	object, err := storage.MinioClient.GetObject(ctx, p.minioCfg.BucketName, objectName, minio.GetObjectOptions{})
@@ -105,10 +106,6 @@ func (p *Processor) Process(ctx context.Context, task tasks.FileProcessingTask) 
 
 	log.Info("[Processor] 阶段一: 开始将分块文本存入数据库")
 
-	if err := p.docVectorRepo.DeleteByFileMD5(task.FileMD5); err != nil {
-		log.Warnf("[Processor] 清理 document_vectors 旧记录失败 (file_md5=%s): %v", task.FileMD5, err)
-	}
-
 	dbVectors := make([]*model.DocumentVector, 0, len(chunks))
 
 	for i, chunk := range chunks {
@@ -122,27 +119,19 @@ func (p *Processor) Process(ctx context.Context, task tasks.FileProcessingTask) 
 		})
 	}
 
-	if err := p.docVectorRepo.BatchCreate(dbVectors); err != nil {
+	if err := p.docVectorRepo.ReplaceByFileMD5(task.FileMD5, dbVectors); err != nil {
 		log.Errorf("[Processor] 阶段一: 批量保存文本分块到数据库失败, Error: %v", err)
 		return fmt.Errorf("批量保存文本分块失败: %w", err)
 	}
 
 	log.Infof("[Processor] 阶段一: 成功将 %d 个分块存入数据库", len(dbVectors))
 
-	log.Info("[Processor] 阶段二: 开始从数据库读取分块并进行向量化")
-
-	savedVectors, err := p.docVectorRepo.FindByFileMD5(task.FileMD5)
-	if err != nil {
-		log.Errorf("[Processor] 阶段二: 从数据库读取分块失败, FileMD5: %s, Error: %v", task.FileMD5, err)
-		return fmt.Errorf("从数据库读取分块失败: %w", err)
-	}
-
-	log.Infof("[Processor] 阶段二: 成功从数据库读取 %d 个分块", len(savedVectors))
+	log.Info("[Processor] 阶段二: 开始使用已保存的分块进行向量化")
 
 	log.Info("[Processor] 步骤4: 开始遍历分块并进行向量化与索引")
 
-	for i, docVector := range savedVectors {
-		log.Infof("[Processor] 正在处理分块 %d/%d, ChunkID: %d", i+1, len(savedVectors), docVector.ChunkID)
+	for i, docVector := range dbVectors {
+		log.Infof("[Processor] 正在处理分块 %d/%d, ChunkID: %d", i+1, len(dbVectors), docVector.ChunkID)
 
 		vector, err := p.embeddingClient.CreateEmbedding(ctx, docVector.TextContent)
 		if err != nil {
@@ -169,7 +158,7 @@ func (p *Processor) Process(ctx context.Context, task tasks.FileProcessingTask) 
 			return fmt.Errorf("索引块 %d 到 Elasticsearch 失败: %w", docVector.ChunkID, err)
 		}
 
-		log.Infof("[Processor] 分块 %d/%d 向量化并索引成功", i+1, len(savedVectors))
+		log.Infof("[Processor] 分块 %d/%d 向量化并索引成功", i+1, len(dbVectors))
 	}
 
 	log.Info("[Processor] 步骤4: 所有分块处理完毕")
@@ -179,31 +168,43 @@ func (p *Processor) Process(ctx context.Context, task tasks.FileProcessingTask) 
 
 }
 func (p *Processor) splitText(text string, chunkSize int, chunkOverlap int) []string {
+	// 如果分块大小小于等于重叠大小，step 会小于等于 0，无法正常向前推进。
 	if chunkSize <= chunkOverlap {
+		// 这种异常配置下退回简单切分：只按 chunkSize 切，不做 overlap。
 		return p.simpleSplit(text, chunkSize)
 	}
 
+	// 保存最终切出来的文本块。
 	var chunks []string
+	// 把字符串转成 rune 切片，按 Unicode 字符切分，避免按字节切坏中文。
 	runes := []rune(text)
+	// 空文本没有可切分内容，直接返回 nil。
 	if len(runes) == 0 {
 		return nil
 	}
 
+	// 每次窗口向前移动的步长；比如 chunkSize=1000、overlap=100，则每次前进 900 个字符。
 	step := chunkSize - chunkOverlap
 
+	// 从文本开头开始，用滑动窗口不断截取 chunk。
 	for i := 0; i < len(runes); i += step {
+		// 当前 chunk 的结束位置，默认取 chunkSize 个字符。
 		end := i + chunkSize
+		// 如果结束位置超过文本长度，就截到文本末尾，避免越界。
 		if end > len(runes) {
 			end = len(runes)
 		}
 
+		// 把当前窗口内的 rune 转回字符串，并加入结果列表。
 		chunks = append(chunks, string(runes[i:end]))
 
+		// 如果已经切到文本末尾，说明没有剩余内容，结束循环。
 		if end == len(runes) {
 			break
 		}
 	}
 
+	// 返回所有切好的文本块。
 	return chunks
 }
 

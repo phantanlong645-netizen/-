@@ -12,14 +12,21 @@ import (
 	"RAG-repository/internal/config"
 	"RAG-repository/internal/model"
 	"RAG-repository/internal/repository"
+	"RAG-repository/internal/storagepath"
 	"RAG-repository/pkg/kafka"
 	"RAG-repository/pkg/log"
 	"RAG-repository/pkg/storage"
 	"RAG-repository/pkg/tasks"
 
+	"github.com/go-sql-driver/mysql"
 	"github.com/minio/minio-go/v7"
 	"gorm.io/gorm"
 )
+
+func isDuplicateKeyError(err error) bool {
+	var mysqlErr *mysql.MySQLError
+	return errors.As(err, &mysqlErr) && mysqlErr.Number == 1062
+}
 
 const (
 	// DefaultChunkSize 表示默认分片大小，5MB 一个分片。
@@ -176,12 +183,24 @@ func (s *uploadService) UploadChunk(ctx context.Context, fileMD5, fileName strin
 		}
 		// 把文件上传主记录写入数据库。
 		if err := s.uploadRepo.CreateFileUploadRecord(newRecord); err != nil {
-			// 数据库写入失败就不能继续上传。
-			log.Errorf("[UploadChunk] 创建文件上传记录失败，error: %v", err)
-			return nil, 0, err
+			if isDuplicateKeyError(err) {
+				log.Infof("[UploadChunk] file_upload already exists after concurrent create, fileMD5: %s, userID: %d", fileMD5, userID)
+				existingRecord, findErr := s.uploadRepo.GetFileUploadRecord(fileMD5, userID)
+				if findErr != nil {
+					log.Errorf("[UploadChunk] failed to find file_upload after duplicate key, error: %v", findErr)
+					return nil, 0, findErr
+				}
+				record = existingRecord
+			} else {
+				// 数据库写入失败就不能继续上传。
+				log.Errorf("[UploadChunk] 创建文件上传记录失败，error: %v", err)
+				return nil, 0, err
+			}
 		}
 		// 后续逻辑统一使用 record，所以把新建记录赋值给 record。
-		record = newRecord
+		if record == nil {
+			record = newRecord
+		}
 	} else if err != nil {
 		// 如果不是“记录不存在”，就是数据库查询异常。
 		log.Errorf("[UploadChunk] 查询文件上传记录失败，error: %v", err)
@@ -233,16 +252,47 @@ func (s *uploadService) UploadChunk(ctx context.Context, fileMD5, fileName strin
 		StoragePath: objectName,
 	}
 	// 把分片元信息写入数据库。
+	chunkInfoRecordCreated := false
 	if err := s.uploadRepo.CreateChunkInfoRecord(chunkRecord); err != nil {
-		// 注意：这里如果失败，MinIO 里已经有分片对象，生产环境最好补偿清理。
-		log.Errorf("[UploadChunk] 在数据库中创建分片记录失败，error: %v", err)
-		return nil, 0, err
+		if isDuplicateKeyError(err) {
+			log.Infof("[UploadChunk] chunk_info already exists, fileMD5: %s, chunkIndex: %d", fileMD5, chunkIndex)
+		} else {
+			removeErr := storage.MinioClient.RemoveObject(
+				context.Background(),
+				s.minioCfg.BucketName,
+				objectName,
+				minio.RemoveObjectOptions{},
+			)
+			if removeErr != nil {
+				log.Errorf("[UploadChunk] cleanup orphan chunk object failed, objectName: %s, error: %v", objectName, removeErr)
+			}
+			// 注意：这里如果失败，MinIO 里已经有分片对象，生产环境最好补偿清理。
+			log.Errorf("[UploadChunk] 在数据库中创建分片记录失败，error: %v", err)
+			return nil, 0, err
+		}
+	} else {
+		chunkInfoRecordCreated = true
 	}
 
 	// 数据库记录成功后，在 Redis bitmap 里把该分片标记为已上传。
 	if err := s.uploadRepo.MarkChunkUploaded(ctx, fileMD5, userID, chunkIndex); err != nil {
-		// Redis 标记失败会影响断点续传和合并完整性判断，所以这里直接返回错误。
-		log.Errorf("[UploadChunk] 严重错误：在Redis中标记分片已上传失败，error: %v", err)
+		if chunkInfoRecordCreated {
+			if deleteErr := s.uploadRepo.DeleteChunkInfoRecord(fileMD5, chunkIndex); deleteErr != nil {
+				log.Errorf("[UploadChunk] Redis 标记失败后回滚 chunk_info 失败，fileMD5: %s, chunkIndex: %d, error: %v", fileMD5, chunkIndex, deleteErr)
+			}
+
+			removeErr := storage.MinioClient.RemoveObject(
+				context.Background(),
+				s.minioCfg.BucketName,
+				objectName,
+				minio.RemoveObjectOptions{},
+			)
+			if removeErr != nil {
+				log.Errorf("[UploadChunk] Redis 标记失败后删除 MinIO 分片失败，objectName: %s, error: %v", objectName, removeErr)
+			}
+		}
+
+		log.Errorf("[UploadChunk] Redis 标记分片失败，已按需回滚 DB 和 MinIO。fileMD5: %s, chunkIndex: %d, error: %v", fileMD5, chunkIndex, err)
 		return nil, 0, err
 	}
 
@@ -290,7 +340,7 @@ func (s *uploadService) MergeChunks(ctx context.Context, fileMD5, fileName strin
 	}
 
 	// 生成完整文件在 MinIO 里的对象名。
-	destObjectName := fmt.Sprintf("merged/%s", fileName)
+	destObjectName := storagepath.MergedObjectName(userID, fileMD5, fileName)
 
 	// 如果只有一个分片，不需要真正 compose，直接 copy 成最终文件。
 	if totalChunks == 1 {
@@ -409,8 +459,8 @@ func (s *uploadService) MergeChunks(ctx context.Context, fileMD5, fileName strin
 			}
 		}()
 		// RemoveObjects 是批量删除接口，这里 fire-and-forget，不阻塞接口返回。
-		for range storage.MinioClient.RemoveObjects(bgCtx, s.minioCfg.BucketName, objectsCh, minio.RemoveObjectsOptions{}) {
-			// 当前实现忽略单个对象删除错误；生产环境可以在这里记录错误明细。
+		for removeErr := range storage.MinioClient.RemoveObjects(bgCtx, s.minioCfg.BucketName, objectsCh, minio.RemoveObjectsOptions{}) {
+			log.Warnf("[MergeChunks] 删除分片对象失败，objectName: %s, error: %v", removeErr.ObjectName, removeErr.Err)
 		}
 		// 记录清理完成。
 		log.Infof("[MergeChunks] 后台清理任务完成。文件MD5: %s", fileMD5)

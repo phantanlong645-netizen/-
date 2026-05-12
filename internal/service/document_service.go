@@ -3,7 +3,6 @@ package service
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net/url"
 	"strings"
 	"time"
@@ -11,6 +10,7 @@ import (
 	"RAG-repository/internal/config"
 	"RAG-repository/internal/model"
 	"RAG-repository/internal/repository"
+	"RAG-repository/internal/storagepath"
 	"RAG-repository/pkg/storage"
 	"RAG-repository/pkg/tika"
 
@@ -125,7 +125,7 @@ func (s *documentService) DeleteDocument(fileMD5 string, user *model.User) error
 		return errors.New("没有权限删除此文件")
 	}
 
-	objectName := fmt.Sprintf("merged/%s", record.FileName)
+	objectName := storagepath.MergedObjectName(record.UserID, record.FileMD5, record.FileName)
 	err = storage.MinioClient.RemoveObject(context.Background(), s.minioCfg.BucketName, objectName, minio.RemoveObjectOptions{})
 	if err != nil {
 		// 原项目这里忽略 MinIO 删除失败，继续删除数据库记录。
@@ -153,7 +153,7 @@ func (s *documentService) GenerateDownloadURL(fileName string, user *model.User)
 	}
 
 	expiry := time.Hour
-	objectName := fmt.Sprintf("uploads/%d/%s", targetFile.UserID, targetFile.FileName)
+	objectName := storagepath.MergedObjectName(targetFile.UserID, targetFile.FileMD5, targetFile.FileName)
 	presignedURL, err := storage.MinioClient.PresignedGetObject(context.Background(), s.minioCfg.BucketName, objectName, expiry, url.Values{})
 	if err != nil {
 		return nil, err
@@ -184,7 +184,7 @@ func (s *documentService) GetFilePreviewContent(fileName string, user *model.Use
 		return nil, errors.New("文件不存在或无权访问")
 	}
 
-	objectName := fmt.Sprintf("uploads/%d/%s", targetFile.UserID, targetFile.FileName)
+	objectName := storagepath.MergedObjectName(targetFile.UserID, targetFile.FileMD5, targetFile.FileName)
 	object, err := storage.MinioClient.GetObject(context.Background(), s.minioCfg.BucketName, objectName, minio.GetObjectOptions{})
 	if err != nil {
 		return nil, err

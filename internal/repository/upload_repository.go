@@ -47,6 +47,9 @@ type UploadRepository interface {
 	// 创建分片记录，写 MySQL 的 chunk_info 表。
 	CreateChunkInfoRecord(record *model.ChunkInfo) error
 
+	// 删除某个分片记录，用于 Redis 写入失败后的数据库补偿回滚。
+	DeleteChunkInfoRecord(fileMD5 string, chunkIndex int) error
+
 	// 查询某个文件的所有分片记录，用于合并文件。
 	GetChunkInfoRecords(fileMD5 string) ([]model.ChunkInfo, error)
 
@@ -194,6 +197,14 @@ func (r *uploadRepository) UpdateFileUploadRecord(record *model.FileUpload) erro
 // 注意：分片文件本体在 MinIO，这里只记录分片元数据。
 func (r *uploadRepository) CreateChunkInfoRecord(record *model.ChunkInfo) error {
 	return r.db.Create(record).Error
+}
+
+// DeleteChunkInfoRecord 删除某个文件的指定分片记录。
+func (r *uploadRepository) DeleteChunkInfoRecord(fileMD5 string, chunkIndex int) error {
+	return r.db.
+		Where("file_md5 = ? AND chunk_index = ?", fileMD5, chunkIndex).
+		Delete(&model.ChunkInfo{}).
+		Error
 }
 
 // IsChunkUploaded 判断某个分片是否已经上传过。
