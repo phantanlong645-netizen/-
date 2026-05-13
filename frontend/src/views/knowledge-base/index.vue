@@ -75,6 +75,12 @@ const { columns, columnChecks, data, getData, loading } = useTable({
       render: row => renderStatus(row.status, row.progress)
     },
     {
+      key: 'vectorizationStatus',
+      title: '知识库状态',
+      width: 120,
+      render: row => renderVectorizationStatus(row)
+    },
+    {
       key: 'orgTagName',
       title: '组织标签',
       width: 150,
@@ -125,8 +131,25 @@ const { columns, columnChecks, data, getData, loading } = useTable({
 
 const store = useKnowledgeBaseStore();
 const { tasks } = storeToRefs(store);
+let vectorizationPollingTimer: ReturnType<typeof setInterval> | null = null;
+
 onMounted(async () => {
   await getList();
+  vectorizationPollingTimer = setInterval(() => {
+    const hasRunningVectorization = tasks.value.some(
+      item =>
+        item.status === UploadStatus.Completed &&
+        (item.vectorizationStatus === 'PENDING' || item.vectorizationStatus === 'PROCESSING')
+    );
+    if (hasRunningVectorization) getList();
+  }, 5000);
+});
+
+onUnmounted(() => {
+  if (vectorizationPollingTimer) {
+    clearInterval(vectorizationPollingTimer);
+    vectorizationPollingTimer = null;
+  }
 });
 
 /** 异步获取列表函数 该函数主要用于更新或初始化上传任务列表 它首先调用getData函数获取数据，然后根据获取到的数据状态更新任务列表 */
@@ -148,6 +171,8 @@ async function getList() {
       // 如果找到匹配项，则更新其状态
       if (index !== -1) {
         tasks.value[index].status = UploadStatus.Completed;
+        tasks.value[index].vectorizationStatus = item.vectorizationStatus;
+        tasks.value[index].vectorizationErrorMessage = item.vectorizationErrorMessage;
       } else {
         // 如果没有找到匹配项，则将该项目添加到任务列表中
         tasks.value.push(item);
@@ -205,6 +230,37 @@ function renderStatus(status: UploadStatus, percentage: number) {
 }
 
 // #region 文件续传
+function renderVectorizationStatus(row: Api.KnowledgeBase.UploadTask) {
+  const status = row.vectorizationStatus || 'PENDING';
+  if (status === 'COMPLETED') return <NTag type="success">已入库</NTag>;
+  if (status === 'PROCESSING') return <NTag type="info">处理中</NTag>;
+  if (status === 'FAILED') {
+    return (
+      <div class="flex items-center gap-4">
+        <NTag type="error" title={row.vectorizationErrorMessage || '后台处理失败'}>
+          处理失败
+        </NTag>
+        <NButton size="tiny" type="primary" ghost onClick={() => retryVectorization(row)}>
+          重试
+        </NButton>
+      </div>
+    );
+  }
+  return <NTag type="warning">等待处理</NTag>;
+}
+
+async function retryVectorization(row: Api.KnowledgeBase.UploadTask) {
+  const { error, data: updatedFile } = await request<Api.KnowledgeBase.UploadTask>({
+    url: `/documents/${row.fileMd5}/vectorization/retry`,
+    method: 'POST'
+  });
+  if (error) return;
+
+  row.vectorizationStatus = updatedFile.vectorizationStatus || 'PENDING';
+  row.vectorizationErrorMessage = updatedFile.vectorizationErrorMessage || null;
+  window.$message?.success('已提交重试任务');
+}
+
 function renderResumeUploadButton(row: Api.KnowledgeBase.UploadTask) {
   if (row.status === UploadStatus.Break) {
     if (row.file)
@@ -285,7 +341,7 @@ async function onBeforeUpload(
         :data="tasks"
         size="small"
         :flex-height="!appStore.isMobile"
-        :scroll-x="962"
+        :scroll-x="1082"
         :loading="loading"
         remote
         :row-key="row => row.id"

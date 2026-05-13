@@ -30,6 +30,8 @@ CREATE TABLE file_upload (
                              file_name    VARCHAR(255)     NOT NULL COMMENT '文件名称',
                              total_size   BIGINT           NOT NULL COMMENT '文件大小',
                              status       TINYINT          NOT NULL DEFAULT 0 COMMENT '上传状态',
+                             vectorization_status VARCHAR(32) NOT NULL DEFAULT 'PENDING' COMMENT 'vectorization status',
+                             vectorization_error_message VARCHAR(1000) DEFAULT '' COMMENT 'vectorization error message',
                              user_id      VARCHAR(64)      NOT NULL COMMENT '用户 ID',
                              org_tag      VARCHAR(50)      DEFAULT NULL COMMENT '组织标签',
                              is_public    TINYINT(1)       NOT NULL DEFAULT 0 COMMENT '是否公开',

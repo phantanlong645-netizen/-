@@ -173,7 +173,8 @@ func (s *uploadService) UploadChunk(ctx context.Context, fileMD5, fileName strin
 			// TotalSize 保存完整文件大小，用来计算总分片数。
 			TotalSize: totalSize,
 			// Status=0 表示上传中，Status=1 表示合并完成。
-			Status: 0,
+			Status:              model.FileUploadStatusUploading,
+			VectorizationStatus: model.VectorizationStatusPending,
 			// UserID 表示这个上传记录属于哪个用户。
 			UserID: userID,
 			// OrgTag 表示该文件归属哪个组织权限范围。
@@ -400,7 +401,7 @@ func (s *uploadService) MergeChunks(ctx context.Context, fileMD5, fileName strin
 	}
 
 	// MinIO 合并成功后，把数据库状态更新为 1，表示上传完成。
-	if err := s.uploadRepo.UpdateFileUploadStatus(record.ID, 1); err != nil {
+	if err := s.uploadRepo.UpdateFileUploadStatus(record.ID, model.FileUploadStatusCompleted); err != nil {
 		// 数据库状态更新失败会导致后续秒传查不到完成状态。
 		log.Errorf("[MergeChunks] 更新数据库文件状态为“已完成”失败，error: %v", err)
 		return "", err
@@ -409,6 +410,11 @@ func (s *uploadService) MergeChunks(ctx context.Context, fileMD5, fileName strin
 	log.Infof("[MergeChunks] 数据库文件状态已更新为“已完成”。文件ID: %d", record.ID)
 
 	// 给合并后的对象生成一个临时访问 URL。
+	if err := s.uploadRepo.UpdateFileVectorizationStatus(record.ID, model.VectorizationStatusPending, ""); err != nil {
+		log.Errorf("[MergeChunks] update vectorization status to pending failed, error: %v", err)
+		return "", err
+	}
+
 	objectURL, _ := storage.GetPresignedURL(s.minioCfg.BucketName, destObjectName, 60*60)
 	// 构造文件处理任务，后续消费者会解析文件、切片、向量化、入库。
 	task := tasks.FileProcessingTask{
@@ -429,6 +435,9 @@ func (s *uploadService) MergeChunks(ctx context.Context, fileMD5, fileName strin
 	if err := kafka.ProduceFileTask(task); err != nil {
 		// Kafka 失败只记录日志，不阻断上传返回，因为文件已经合并成功。
 		log.Errorf("[MergeChunks] 发送文件处理任务到Kafka失败，error: %v", err)
+		if updateErr := s.uploadRepo.UpdateFileVectorizationStatus(record.ID, model.VectorizationStatusFailed, "send file processing task to Kafka failed: "+err.Error()); updateErr != nil {
+			log.Errorf("[MergeChunks] update vectorization status to failed failed, error: %v", updateErr)
+		}
 	} else {
 		// Kafka 成功表示异步处理流程已经被触发。
 		log.Infof("[MergeChunks] 文件处理任务已成功发送到Kafka。")

@@ -65,7 +65,7 @@ func main() {
 	userService := service.NewUserService(userRepository, orgTagRepo, jwtManager)
 	adminService := service.NewAdminService(orgTagRepo, userRepository, conversationRepo)
 	uploadService := service.NewUploadService(uploadRepo, userRepository, cfg.MinIO)
-	documentService := service.NewDocumentService(uploadRepo, userRepository, orgTagRepo, cfg.MinIO, tikaClient)
+	documentService := service.NewDocumentService(uploadRepo, userRepository, orgTagRepo, docVectorRepo, cfg.MinIO, cfg.Elasticsearch, tikaClient)
 	searchService := service.NewSearchService(embeddingClient, es.ESClient, userService, uploadRepo)
 	conversationService := service.NewConversationService(conversationRepo)
 	chatService := service.NewChatService(searchService, llmClient, conversationRepo)
@@ -162,6 +162,7 @@ func registerRoutes(
 			documents.GET("/accessible", handler.NewDocumentHandler(documentService, userService).ListAccessibleFiles)
 			documents.GET("/uploads", handler.NewDocumentHandler(documentService, userService).ListUploadedFiles)
 			documents.DELETE("/:fileMd5", handler.NewDocumentHandler(documentService, userService).DeleteDocument)
+			documents.POST("/:fileMd5/vectorization/retry", handler.NewDocumentHandler(documentService, userService).RetryVectorization)
 			documents.GET("/download", handler.NewDocumentHandler(documentService, userService).GenerateDownloadURL)
 			documents.GET("/preview", handler.NewDocumentHandler(documentService, userService).PreviewFile)
 		}

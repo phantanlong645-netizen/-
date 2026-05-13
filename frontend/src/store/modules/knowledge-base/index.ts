@@ -154,6 +154,8 @@ export const useKnowledgeBaseStore = defineStore(SetupStoreId.KnowledgeBase, () 
       const index = tasks.value.findIndex(t => t.fileMd5 === task.fileMd5);
       // 将任务状态标记为已完成。
       tasks.value[index].status = UploadStatus.Completed;
+      tasks.value[index].vectorizationStatus = 'PENDING';
+      tasks.value[index].vectorizationErrorMessage = null;
       // 返回 true 表示合并成功。
       return true;
     } catch {
@@ -218,6 +220,10 @@ export const useKnowledgeBaseStore = defineStore(SetupStoreId.KnowledgeBase, () 
       progress: 0,
       // 初始状态为等待上传。
       status: UploadStatus.Pending,
+      // 文件合并后才会进入后台知识库处理；上传阶段先标记为等待处理。
+      vectorizationStatus: 'PENDING',
+      // 后台处理失败时由后端文件列表返回失败原因。
+      vectorizationErrorMessage: null,
       // 用户选择的组织标签。
       orgTag: form.orgTag
     };

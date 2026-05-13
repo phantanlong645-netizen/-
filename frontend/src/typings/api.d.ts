@@ -147,6 +147,8 @@ declare namespace Api {
       uploadedChunks: number[];
       progress: number;
       status: UploadStatus;
+      vectorizationStatus?: 'PENDING' | 'PROCESSING' | 'COMPLETED' | 'FAILED' | null;
+      vectorizationErrorMessage?: string | null;
       createdAt?: string;
       mergedAt?: string;
       requestIds?: string[]; // 请求ID，用于取消上传

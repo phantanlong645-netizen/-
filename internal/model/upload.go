@@ -8,19 +8,28 @@ const (
 	FileUploadStatusFailed    = 2
 )
 
+const (
+	VectorizationStatusPending    = "PENDING"
+	VectorizationStatusProcessing = "PROCESSING"
+	VectorizationStatusCompleted  = "COMPLETED"
+	VectorizationStatusFailed     = "FAILED"
+)
+
 // FileUpload 记录一个文件上传任务的元数据。
 // 它不是文件本体，文件本体在 MinIO，这里只存文件名、MD5、大小、状态等信息。
 type FileUpload struct {
-	ID        uint       `gorm:"primaryKey;autoIncrement" json:"id"`
-	FileMD5   string     `gorm:"type:varchar(32);not null;uniqueIndex:uk_md5_user" json:"fileMd5"`
-	FileName  string     `gorm:"type:varchar(255);not null" json:"fileName"`
-	TotalSize int64      `gorm:"not null" json:"totalSize"`
-	Status    int        `gorm:"type:tinyint;not null;default:0" json:"status"`
-	UserID    uint       `gorm:"not null;uniqueIndex:uk_md5_user" json:"userId"`
-	OrgTag    string     `gorm:"type:varchar(50)" json:"orgTag"`
-	IsPublic  bool       `gorm:"not null;default:false" json:"isPublic"`
-	CreatedAt time.Time  `gorm:"autoCreateTime" json:"createdAt"`
-	MergedAt  *time.Time `gorm:"default:null" json:"mergedAt"`
+	ID                        uint       `gorm:"primaryKey;autoIncrement" json:"id"`
+	FileMD5                   string     `gorm:"type:varchar(32);not null;uniqueIndex:uk_md5_user" json:"fileMd5"`
+	FileName                  string     `gorm:"type:varchar(255);not null" json:"fileName"`
+	TotalSize                 int64      `gorm:"not null" json:"totalSize"`
+	Status                    int        `gorm:"type:tinyint;not null;default:0" json:"status"`
+	VectorizationStatus       string     `gorm:"type:varchar(32);not null;default:'PENDING'" json:"vectorizationStatus"`
+	VectorizationErrorMessage string     `gorm:"type:varchar(1000)" json:"vectorizationErrorMessage"`
+	UserID                    uint       `gorm:"not null;uniqueIndex:uk_md5_user" json:"userId"`
+	OrgTag                    string     `gorm:"type:varchar(50)" json:"orgTag"`
+	IsPublic                  bool       `gorm:"not null;default:false" json:"isPublic"`
+	CreatedAt                 time.Time  `gorm:"autoCreateTime" json:"createdAt"`
+	MergedAt                  *time.Time `gorm:"default:null" json:"mergedAt"`
 }
 
 func (FileUpload) TableName() string {

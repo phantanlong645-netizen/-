@@ -54,6 +54,10 @@ func NewProcessor(
 func (p *Processor) Process(ctx context.Context, task tasks.FileProcessingTask) error {
 	log.Infof("[Processor] 开始处理文件, FileMD5: %s, FileName: %s, UserID: %d", task.FileMD5, task.FileName, task.UserID)
 
+	if err := p.uploadRepo.UpdateFileVectorizationStatusByMD5AndUserID(task.FileMD5, task.UserID, model.VectorizationStatusProcessing, ""); err != nil {
+		return fmt.Errorf("update vectorization status to processing failed: %w", err)
+	}
+
 	objectName := storagepath.MergedObjectName(task.UserID, task.FileMD5, task.FileName)
 	log.Infof("[Processor] 步骤1: 从MinIO下载文件, Bucket: %s, Object: %s", p.minioCfg.BucketName, objectName)
 
@@ -163,6 +167,10 @@ func (p *Processor) Process(ctx context.Context, task tasks.FileProcessingTask) 
 
 	log.Info("[Processor] 步骤4: 所有分块处理完毕")
 	log.Infof("[Processor] 文件处理成功完成, FileMD5: %s", task.FileMD5)
+
+	if err := p.uploadRepo.UpdateFileVectorizationStatusByMD5AndUserID(task.FileMD5, task.UserID, model.VectorizationStatusCompleted, ""); err != nil {
+		return fmt.Errorf("update vectorization status to completed failed: %w", err)
+	}
 
 	return nil
 

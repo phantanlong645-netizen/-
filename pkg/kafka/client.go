@@ -50,7 +50,18 @@ func ProduceFileTask(task tasks.FileProcessingTask) error {
 	)
 }
 
-// StartConsumer 启动 Kafka 消费者，持续消费文件处理任务。
+func ResetFileTaskAttempts(fileMD5 string) error {
+	return database.RDB.Del(context.Background(), fmt.Sprintf("kafka:attempts:%s", fileMD5)).Err()
+}
+
+func trimErrorMessage(message string, maxLength int) string {
+	if len(message) <= maxLength {
+		return message
+	}
+	return message[:maxLength]
+}
+
+// StartConsumer ?? Kafka ???,???????????
 func StartConsumer(cfg config.KafkaConfig, processor TaskProcessor) {
 	// 创建 Kafka reader，也就是消费者客户端。
 	r := kafka.NewReader(kafka.ReaderConfig{
@@ -132,7 +143,10 @@ func StartConsumer(cfg config.KafkaConfig, processor TaskProcessor) {
 				if err := database.DB.
 					Model(&model.FileUpload{}).
 					Where("file_md5 = ? AND user_id = ?", task.FileMD5, task.UserID).
-					Update("status", model.FileUploadStatusFailed).
+					Updates(map[string]interface{}{
+						"vectorization_status":        model.VectorizationStatusFailed,
+						"vectorization_error_message": trimErrorMessage(err.Error(), 1000),
+					}).
 					Error; err != nil {
 					log.Errorf("failed to mark file upload as failed: md5=%s, userID=%d, error=%v", task.FileMD5, task.UserID, err)
 					continue

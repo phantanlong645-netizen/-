@@ -98,6 +98,33 @@ func (h *DocumentHandler) DeleteDocument(c *gin.Context) {
 }
 
 // GenerateDownloadURL 生成文件临时下载链接。
+func (h *DocumentHandler) RetryVectorization(c *gin.Context) {
+	fileMD5 := c.Param("fileMd5")
+	if fileMD5 == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "缺少文件 MD5"})
+		return
+	}
+
+	user, err := h.getUserFromContext(c)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "无法获取用户信息"})
+		return
+	}
+
+	file, err := h.docService.RetryVectorization(fileMD5, user)
+	if err != nil {
+		log.Warnf("RetryVectorization: failed for user %s, md5 %s, err: %v", user.Username, fileMD5, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"code":    http.StatusOK,
+		"message": "已提交知识库处理重试任务",
+		"data":    file,
+	})
+}
+
 func (h *DocumentHandler) GenerateDownloadURL(c *gin.Context) {
 	fileName := c.Query("fileName")
 	if fileName == "" {

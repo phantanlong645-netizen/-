@@ -134,3 +134,39 @@ func IndexDocument(ctx context.Context, indexName string, doc model.EsDocument) 
 
 	return nil
 }
+
+// DeleteByFileMD5 删除某个文件在 Elasticsearch 中的所有分块索引。
+func DeleteByFileMD5(ctx context.Context, indexName string, fileMD5 string) error {
+	query := map[string]interface{}{
+		"query": map[string]interface{}{
+			"term": map[string]interface{}{
+				"file_md5": fileMD5,
+			},
+		},
+	}
+
+	queryBytes, err := json.Marshal(query)
+	if err != nil {
+		return err
+	}
+
+	refresh := true
+	req := esapi.DeleteByQueryRequest{
+		Index:   []string{indexName},
+		Body:    bytes.NewReader(queryBytes),
+		Refresh: &refresh,
+	}
+
+	res, err := req.Do(ctx, ESClient)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+
+	if res.IsError() {
+		log.Errorf("从 Elasticsearch 删除文件索引失败，fileMD5: %s, response: %s", fileMD5, res.String())
+		return errors.New("failed to delete document from elasticsearch")
+	}
+
+	return nil
+}

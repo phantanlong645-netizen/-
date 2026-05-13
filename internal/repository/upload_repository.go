@@ -28,6 +28,8 @@ type UploadRepository interface {
 
 	// 更新文件上传状态，例如 uploading/completed/failed。
 	UpdateFileUploadStatus(recordID uint, status int) error
+	UpdateFileVectorizationStatus(recordID uint, status string, errorMessage string) error
+	UpdateFileVectorizationStatusByMD5AndUserID(fileMD5 string, userID uint, status string, errorMessage string) error
 
 	// 查询某个用户上传过的所有文件。
 	FindFilesByUserID(userID uint) ([]model.FileUpload, error)
@@ -136,8 +138,32 @@ func (r *uploadRepository) UpdateFileUploadStatus(recordID uint, status int) err
 		Error
 }
 
-// GetChunkInfoRecords 查询某个文件的所有分片记录。
-// 合并文件时要按 chunk_index 顺序取出分片。
+// UpdateFileVectorizationStatus updates file vectorization status.
+func (r *uploadRepository) UpdateFileVectorizationStatus(recordID uint, status string, errorMessage string) error {
+	return r.db.
+		Model(&model.FileUpload{}).
+		Where("id = ?", recordID).
+		Updates(map[string]interface{}{
+			"vectorization_status":        status,
+			"vectorization_error_message": errorMessage,
+		}).
+		Error
+}
+
+// UpdateFileVectorizationStatusByMD5AndUserID updates vectorization status by file and user.
+func (r *uploadRepository) UpdateFileVectorizationStatusByMD5AndUserID(fileMD5 string, userID uint, status string, errorMessage string) error {
+	return r.db.
+		Model(&model.FileUpload{}).
+		Where("file_md5 = ? AND user_id = ?", fileMD5, userID).
+		Updates(map[string]interface{}{
+			"vectorization_status":        status,
+			"vectorization_error_message": errorMessage,
+		}).
+		Error
+}
+
+// GetChunkInfoRecords queries all chunk records for a file.
+// Merge needs these records ordered by chunk_index.
 func (r *uploadRepository) GetChunkInfoRecords(fileMD5 string) ([]model.ChunkInfo, error) {
 	var chunks []model.ChunkInfo
 

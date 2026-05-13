@@ -11,7 +11,10 @@ import (
 	"RAG-repository/internal/model"
 	"RAG-repository/internal/repository"
 	"RAG-repository/internal/storagepath"
+	"RAG-repository/pkg/es"
+	"RAG-repository/pkg/kafka"
 	"RAG-repository/pkg/storage"
+	"RAG-repository/pkg/tasks"
 	"RAG-repository/pkg/tika"
 
 	"github.com/minio/minio-go/v7"
@@ -38,25 +41,30 @@ type DocumentService interface {
 	ListAccessibleFiles(user *model.User) ([]model.FileUpload, error)
 	ListUploadedFiles(userID uint) ([]FileUploadDTO, error)
 	DeleteDocument(fileMD5 string, user *model.User) error
+	RetryVectorization(fileMD5 string, user *model.User) (*model.FileUpload, error)
 	GenerateDownloadURL(fileName string, user *model.User) (*DownloadInfoDTO, error)
 	GetFilePreviewContent(fileName string, user *model.User) (*PreviewInfoDTO, error)
 }
 
 type documentService struct {
-	uploadRepo repository.UploadRepository
-	userRepo   repository.UserRepository
-	orgTagRepo repository.OrgTagRepository
-	minioCfg   config.MinIOConfig
-	tikaClient *tika.Client
+	uploadRepo    repository.UploadRepository
+	userRepo      repository.UserRepository
+	orgTagRepo    repository.OrgTagRepository
+	docVectorRepo repository.DocumentVectorRepository
+	minioCfg      config.MinIOConfig
+	esCfg         config.ElasticsearchConfig
+	tikaClient    *tika.Client
 }
 
-func NewDocumentService(uploadRepo repository.UploadRepository, userRepo repository.UserRepository, orgTagRepo repository.OrgTagRepository, minioCfg config.MinIOConfig, tikaClient *tika.Client) DocumentService {
+func NewDocumentService(uploadRepo repository.UploadRepository, userRepo repository.UserRepository, orgTagRepo repository.OrgTagRepository, docVectorRepo repository.DocumentVectorRepository, minioCfg config.MinIOConfig, esCfg config.ElasticsearchConfig, tikaClient *tika.Client) DocumentService {
 	return &documentService{
-		uploadRepo: uploadRepo,
-		userRepo:   userRepo,
-		orgTagRepo: orgTagRepo,
-		minioCfg:   minioCfg,
-		tikaClient: tikaClient,
+		uploadRepo:    uploadRepo,
+		userRepo:      userRepo,
+		orgTagRepo:    orgTagRepo,
+		docVectorRepo: docVectorRepo,
+		minioCfg:      minioCfg,
+		esCfg:         esCfg,
+		tikaClient:    tikaClient,
 	}
 }
 
@@ -125,6 +133,14 @@ func (s *documentService) DeleteDocument(fileMD5 string, user *model.User) error
 		return errors.New("没有权限删除此文件")
 	}
 
+	if err := es.DeleteByFileMD5(context.Background(), s.esCfg.IndexName, fileMD5); err != nil {
+		return err
+	}
+
+	if err := s.docVectorRepo.DeleteByFileMD5(fileMD5); err != nil {
+		return err
+	}
+
 	objectName := storagepath.MergedObjectName(record.UserID, record.FileMD5, record.FileName)
 	err = storage.MinioClient.RemoveObject(context.Background(), s.minioCfg.BucketName, objectName, minio.RemoveObjectOptions{})
 	if err != nil {
@@ -132,6 +148,46 @@ func (s *documentService) DeleteDocument(fileMD5 string, user *model.User) error
 	}
 
 	return s.uploadRepo.DeleteFileUploadRecord(fileMD5, record.UserID)
+}
+
+func (s *documentService) RetryVectorization(fileMD5 string, user *model.User) (*model.FileUpload, error) {
+	record, err := s.uploadRepo.GetFileUploadRecord(fileMD5, user.ID)
+	if err != nil {
+		return nil, errors.New("文件不存在或不属于该用户")
+	}
+
+	if record.UserID != user.ID && user.Role != "ADMIN" {
+		return nil, errors.New("没有权限重试此文件")
+	}
+
+	if record.Status != model.FileUploadStatusCompleted {
+		return nil, errors.New("文件尚未上传完成，不能重试入库")
+	}
+
+	if err := kafka.ResetFileTaskAttempts(fileMD5); err != nil {
+		return nil, err
+	}
+
+	if err := s.uploadRepo.UpdateFileVectorizationStatus(record.ID, model.VectorizationStatusPending, ""); err != nil {
+		return nil, err
+	}
+
+	task := tasks.FileProcessingTask{
+		FileMD5:  record.FileMD5,
+		FileName: record.FileName,
+		UserID:   record.UserID,
+		OrgTag:   record.OrgTag,
+		IsPublic: record.IsPublic,
+	}
+
+	if err := kafka.ProduceFileTask(task); err != nil {
+		_ = s.uploadRepo.UpdateFileVectorizationStatus(record.ID, model.VectorizationStatusFailed, "send file processing task to Kafka failed: "+err.Error())
+		return nil, err
+	}
+
+	record.VectorizationStatus = model.VectorizationStatusPending
+	record.VectorizationErrorMessage = ""
+	return record, nil
 }
 
 func (s *documentService) GenerateDownloadURL(fileName string, user *model.User) (*DownloadInfoDTO, error) {
