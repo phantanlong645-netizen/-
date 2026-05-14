@@ -135,6 +135,83 @@ func IndexDocument(ctx context.Context, indexName string, doc model.EsDocument) 
 	return nil
 }
 
+// BulkIndexDocuments 批量写入多个文本分块到 Elasticsearch。
+// 每个分块使用 vector_id 作为 ES 文档 ID，因此同一个文件重试时会覆盖同一个 chunk，不会产生重复索引。
+func BulkIndexDocuments(ctx context.Context, indexName string, docs []model.EsDocument) error {
+	if len(docs) == 0 {
+		return nil
+	}
+
+	var buf bytes.Buffer
+	for _, doc := range docs {
+		action := map[string]interface{}{
+			"index": map[string]interface{}{
+				"_index": indexName,
+				"_id":    doc.VectorID,
+			},
+		}
+
+		actionBytes, err := json.Marshal(action)
+		if err != nil {
+			return err
+		}
+		docBytes, err := json.Marshal(doc)
+		if err != nil {
+			return err
+		}
+
+		buf.Write(actionBytes)
+		buf.WriteByte('\n')
+		buf.Write(docBytes)
+		buf.WriteByte('\n')
+	}
+
+	req := esapi.BulkRequest{
+		Index:   indexName,
+		Body:    &buf,
+		Refresh: "true",
+	}
+
+	res, err := req.Do(ctx, ESClient)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+
+	if res.IsError() {
+		log.Errorf("批量索引文档到 Elasticsearch 出错: %s", res.String())
+		return errors.New("failed to bulk index documents")
+	}
+
+	var bulkResp struct {
+		Errors bool `json:"errors"`
+		Items  []map[string]struct {
+			ID     string `json:"_id"`
+			Status int    `json:"status"`
+			Error  *struct {
+				Type   string `json:"type"`
+				Reason string `json:"reason"`
+			} `json:"error,omitempty"`
+		} `json:"items"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&bulkResp); err != nil {
+		return fmt.Errorf("failed to decode bulk index response: %w", err)
+	}
+
+	if bulkResp.Errors {
+		for _, item := range bulkResp.Items {
+			for op, result := range item {
+				if result.Error != nil {
+					log.Errorf("批量索引文档失败, op: %s, id: %s, status: %d, type: %s, reason: %s", op, result.ID, result.Status, result.Error.Type, result.Error.Reason)
+				}
+			}
+		}
+		return errors.New("bulk index documents partially failed")
+	}
+
+	return nil
+}
+
 // DeleteByFileMD5 删除某个文件在 Elasticsearch 中的所有分块索引。
 func DeleteByFileMD5(ctx context.Context, indexName string, fileMD5 string) error {
 	query := map[string]interface{}{

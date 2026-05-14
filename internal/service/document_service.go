@@ -41,8 +41,8 @@ type DocumentService interface {
 	ListUploadedFiles(userID uint) ([]FileUploadDTO, error)
 	DeleteDocument(fileMD5 string, user *model.User) error
 	RetryVectorization(fileMD5 string, user *model.User) (*model.FileUpload, error)
-	GenerateDownloadURL(fileName string, user *model.User) (*DownloadInfoDTO, error)
-	GetFilePreviewContent(fileName string, user *model.User) (*PreviewInfoDTO, error)
+	GenerateDownloadURL(fileMD5 string, fileName string, user *model.User) (*DownloadInfoDTO, error)
+	GetFilePreviewContent(fileMD5 string, fileName string, user *model.User) (*PreviewInfoDTO, error)
 }
 
 type documentService struct {
@@ -194,22 +194,33 @@ func (s *documentService) RetryVectorization(fileMD5 string, user *model.User) (
 	return record, nil
 }
 
-func (s *documentService) GenerateDownloadURL(fileName string, user *model.User) (*DownloadInfoDTO, error) {
+func (s *documentService) findAccessibleFile(fileMD5 string, fileName string, user *model.User) (*model.FileUpload, error) {
 	files, err := s.ListAccessibleFiles(user)
 	if err != nil {
 		return nil, err
 	}
 
-	var targetFile *model.FileUpload
 	for i := range files {
-		if files[i].FileName == fileName {
-			targetFile = &files[i]
-			break
+		if fileMD5 != "" && files[i].FileMD5 == fileMD5 {
+			return &files[i], nil
 		}
 	}
 
-	if targetFile == nil {
-		return nil, errors.New("文件不存在或无权访问")
+	if fileMD5 == "" {
+		for i := range files {
+			if files[i].FileName == fileName {
+				return &files[i], nil
+			}
+		}
+	}
+
+	return nil, errors.New("文件不存在或无权访问")
+}
+
+func (s *documentService) GenerateDownloadURL(fileMD5 string, fileName string, user *model.User) (*DownloadInfoDTO, error) {
+	targetFile, err := s.findAccessibleFile(fileMD5, fileName, user)
+	if err != nil {
+		return nil, err
 	}
 
 	expiry := time.Hour
@@ -226,22 +237,10 @@ func (s *documentService) GenerateDownloadURL(fileName string, user *model.User)
 	}, nil
 }
 
-func (s *documentService) GetFilePreviewContent(fileName string, user *model.User) (*PreviewInfoDTO, error) {
-	files, err := s.ListAccessibleFiles(user)
+func (s *documentService) GetFilePreviewContent(fileMD5 string, fileName string, user *model.User) (*PreviewInfoDTO, error) {
+	targetFile, err := s.findAccessibleFile(fileMD5, fileName, user)
 	if err != nil {
 		return nil, err
-	}
-
-	var targetFile *model.FileUpload
-	for i := range files {
-		if files[i].FileName == fileName {
-			targetFile = &files[i]
-			break
-		}
-	}
-
-	if targetFile == nil {
-		return nil, errors.New("文件不存在或无权访问")
 	}
 
 	objectName := storagepath.MergedObjectName(targetFile.UserID, targetFile.FileMD5, targetFile.FileName)
@@ -251,7 +250,7 @@ func (s *documentService) GetFilePreviewContent(fileName string, user *model.Use
 	}
 	defer object.Close()
 
-	content, err := s.tikaClient.ExtractText(object, fileName)
+	content, err := s.tikaClient.ExtractText(object, targetFile.FileName)
 	if err != nil {
 		return nil, err
 	}

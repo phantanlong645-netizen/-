@@ -126,9 +126,10 @@ func (h *DocumentHandler) RetryVectorization(c *gin.Context) {
 }
 
 func (h *DocumentHandler) GenerateDownloadURL(c *gin.Context) {
+	fileMD5 := c.Query("fileMd5")
 	fileName := c.Query("fileName")
-	if fileName == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "缺少文件名"})
+	if fileMD5 == "" && fileName == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "缺少文件 MD5 或文件名"})
 		return
 	}
 
@@ -138,9 +139,9 @@ func (h *DocumentHandler) GenerateDownloadURL(c *gin.Context) {
 		return
 	}
 
-	downloadInfo, err := h.docService.GenerateDownloadURL(fileName, user)
+	downloadInfo, err := h.docService.GenerateDownloadURL(fileMD5, fileName, user)
 	if err != nil {
-		log.Warnf("GenerateDownloadURL: failed for user %s, file %s, err: %v", user.Username, fileName, err)
+		log.Warnf("GenerateDownloadURL: failed for user %s, fileMd5 %s, fileName %s, err: %v", user.Username, fileMD5, fileName, err)
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return
 	}
@@ -154,9 +155,10 @@ func (h *DocumentHandler) GenerateDownloadURL(c *gin.Context) {
 
 // PreviewFile 获取文件预览内容。
 func (h *DocumentHandler) PreviewFile(c *gin.Context) {
+	fileMD5 := c.Query("fileMd5")
 	fileName := c.Query("fileName")
-	if fileName == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "缺少文件名"})
+	if fileMD5 == "" && fileName == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "缺少文件 MD5 或文件名"})
 		return
 	}
 
@@ -166,9 +168,9 @@ func (h *DocumentHandler) PreviewFile(c *gin.Context) {
 		return
 	}
 
-	previewInfo, err := h.docService.GetFilePreviewContent(fileName, user)
+	previewInfo, err := h.docService.GetFilePreviewContent(fileMD5, fileName, user)
 	if err != nil {
-		log.Warnf("PreviewFile: failed for user %s, file %s, err: %v", user.Username, fileName, err)
+		log.Warnf("PreviewFile: failed for user %s, fileMd5 %s, fileName %s, err: %v", user.Username, fileMD5, fileName, err)
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return
 	}

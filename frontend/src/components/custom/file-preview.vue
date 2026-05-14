@@ -51,6 +51,7 @@ import { request } from '@/service/request';
 import { getFileExt } from '@/utils/common';
 
 interface Props {
+  fileMd5?: string;
   fileName: string;
   visible: boolean;
 }
@@ -77,23 +78,23 @@ function getFileIcon(fileName: string) {
   return 'dflt';
 }
 
-// 监听文件名变化，加载预览内容
-watch(() => props.fileName, async (newFileName) => {
-  if (newFileName && props.visible) {
+// 监听文件变化，加载预览内容
+watch(() => [props.fileMd5, props.fileName], async ([newFileMd5, newFileName]) => {
+  if ((newFileMd5 || newFileName) && props.visible) {
     await loadPreviewContent();
   }
 }, { immediate: true });
 
 // 监听可见性变化
 watch(() => props.visible, async (visible) => {
-  if (visible && props.fileName) {
+  if (visible && (props.fileMd5 || props.fileName)) {
     await loadPreviewContent();
   }
 });
 
 // 加载预览内容
 async function loadPreviewContent() {
-  if (!props.fileName) return;
+  if (!props.fileMd5 && !props.fileName) return;
   
   loading.value = true;
   error.value = '';
@@ -108,6 +109,7 @@ async function loadPreviewContent() {
     }>({
       url: '/documents/preview',
       params: {
+        fileMd5: props.fileMd5 || undefined,
         fileName: props.fileName,
         token: token || undefined
       }
@@ -127,7 +129,7 @@ async function loadPreviewContent() {
 
 // 下载文件
 async function downloadFile() {
-  if (!props.fileName) return;
+  if (!props.fileMd5 && !props.fileName) return;
   
   downloading.value = true;
   
@@ -140,6 +142,7 @@ async function downloadFile() {
     }>({
       url: '/documents/download',
       params: {
+        fileMd5: props.fileMd5 || undefined,
         fileName: props.fileName,
         token: token || undefined
       }

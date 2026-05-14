@@ -13,6 +13,7 @@ const appStore = useAppStore();
 
 // 文件预览相关状态
 const previewVisible = ref(false);
+const previewFileMd5 = ref('');
 const previewFileName = ref('');
 
 function apiFn() {
@@ -29,14 +30,16 @@ function renderIcon(fileName: string) {
 }
 
 // 处理文件预览
-function handleFilePreview(fileName: string) {
-  previewFileName.value = fileName;
+function handleFilePreview(row: Api.KnowledgeBase.UploadTask) {
+  previewFileMd5.value = row.fileMd5;
+  previewFileName.value = row.fileName;
   previewVisible.value = true;
 }
 
 // 关闭文件预览
 function closeFilePreview() {
   previewVisible.value = false;
+  previewFileMd5.value = '';
   previewFileName.value = '';
 }
 
@@ -54,7 +57,7 @@ const { columns, columnChecks, data, getData, loading } = useTable({
           <NEllipsis lineClamp={2} tooltip>
             <span
               class="cursor-pointer hover:text-primary transition-colors"
-              onClick={() => handleFilePreview(row.fileName)}
+              onClick={() => handleFilePreview(row)}
             >
               {row.fileName}
             </span>
@@ -109,7 +112,7 @@ const { columns, columnChecks, data, getData, loading } = useTable({
             type="primary"
             ghost
             size="small"
-            onClick={() => handleFilePreview(row.fileName)}
+            onClick={() => handleFilePreview(row)}
           >
             预览
           </NButton>
@@ -355,6 +358,7 @@ async function onBeforeUpload(
     <!-- 文件预览弹窗 -->
     <NModal v-model:show="previewVisible" preset="card" title="文件预览" style="width: 80%; max-width: 1000px;">
       <FilePreview
+        :file-md5="previewFileMd5"
         :file-name="previewFileName"
         :visible="previewVisible"
         @close="closeFilePreview"

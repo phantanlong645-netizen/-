@@ -36,6 +36,21 @@ type searchService struct {
 	uploadRepo repository.UploadRepository
 }
 
+type esSearchHit struct {
+	// Source 是 ES 文档的 _source，映射到业务里的 EsDocument。
+	Source model.EsDocument `json:"_source"`
+	// Score 是 ES 对该命中文档计算出来的相关性分数。
+	Score float64 `json:"_score"`
+}
+
+type esSearchResponse struct {
+	// Hits 是 ES 响应里的 hits 外层对象。
+	Hits struct {
+		// Hits 是真正的命中文档数组。
+		Hits []esSearchHit `json:"hits"`
+	} `json:"hits"`
+}
+
 // NewSearchService 组装搜索服务需要的依赖。
 func NewSearchService(
 	// embeddingClient 负责调用向量模型。
@@ -84,11 +99,10 @@ func (s *searchService) HybridSearch(ctx context.Context, query string, topK int
 
 	// 把原始搜索词转换成向量，用于 ES 的 kNN 向量召回。
 	queryVector, err := s.embeddingClient.CreateEmbedding(ctx, query)
-	// 向量生成失败时，搜索无法继续，因为后面的 knn 查询依赖这个向量。
+	// 向量生成失败时降级为纯文本搜索，避免 embedding 服务波动导致知识库完全不可搜。
 	if err != nil {
 		log.Errorf("[SearchService] 向量化查询失败: %v", err)
-		// 把底层错误包装后返回给上层。
-		return nil, fmt.Errorf("failed to create query embedding: %w", err)
+		return s.textOnlySearchWithPermission(ctx, query, normalized, phrase, topK, user, userEffectiveTags)
 	}
 	log.Infof("[SearchService] 向量化查询成功, 向量维度: %d", len(queryVector))
 	// buf 用来承载编码后的 Elasticsearch JSON 请求体。
@@ -209,18 +223,7 @@ func (s *searchService) HybridSearch(ctx context.Context, query string, topK int
 
 	log.Info("[SearchService] 成功从 Elasticsearch 获取响应")
 	// esResponse 只声明当前业务需要的 ES 响应字段。
-	var esResponse struct {
-		// Hits 是 ES 响应里的 hits 外层对象。
-		Hits struct {
-			// Hits 是真正的命中文档数组。
-			Hits []struct {
-				// Source 是 ES 文档的 _source，映射到业务里的 EsDocument。
-				Source model.EsDocument `json:"_source"`
-				// Score 是 ES 对该命中文档计算出来的相关性分数。
-				Score float64 `json:"_score"`
-			} `json:"hits"`
-		} `json:"hits"`
-	}
+	var esResponse esSearchResponse
 
 	// 解析 ES 返回的 JSON 响应体。
 	if err := json.NewDecoder(res.Body).Decode(&esResponse); err != nil {
@@ -289,10 +292,178 @@ func (s *searchService) HybridSearch(ctx context.Context, query string, topK int
 		}
 	}
 
+	return s.assembleSearchResults(esResponse.Hits.Hits)
+}
+
+// textOnlySearchWithPermission 在向量生成失败时执行纯文本搜索，并保留和混合搜索一致的权限过滤。
+func (s *searchService) textOnlySearchWithPermission(ctx context.Context, originalQuery string, normalized string, phrase string, topK int, user *model.User, userEffectiveTags []string) ([]model.SearchResponseDTO, error) {
+	// 记录降级搜索入口，方便排查是否因为 embedding 失败进入了文本搜索。
+	log.Infof("[SearchService] 使用文本搜索降级, query: '%s', topK: %d, user: %s", originalQuery, topK, user.Username)
+
+	// esQuery 是纯文本搜索的 Elasticsearch 查询 DSL。
+	esQuery := map[string]interface{}{
+		// query 定义文本降级搜索的主查询条件。
+		"query": map[string]interface{}{
+			// bool 用来组合正文匹配、权限过滤和短语加权。
+			"bool": map[string]interface{}{
+				// must 表示正文必须匹配当前搜索词。
+				"must": map[string]interface{}{
+					// match 会对 text_content 做 ES 全文检索。
+					"match": map[string]interface{}{
+						// text_content 是文档分块正文，normalized 是清洗后的搜索词。
+						"text_content": normalized,
+					},
+				},
+				// filter 只负责权限过滤，不参与相关性打分。
+				"filter": buildPermissionFilter(user.ID, userEffectiveTags),
+				// should 用短语匹配给更精准的结果加分。
+				"should": buildPhraseShould(phrase),
+			},
+		},
+		// rescore 对初步文本召回结果做二次排序。
+		"rescore": map[string]interface{}{
+			// window_size 控制参与二次排序的候选数量。
+			"window_size": topK * 30,
+			// query 定义二次排序查询和权重。
+			"query": map[string]interface{}{
+				// rescore_query 是二次排序时额外执行的正文匹配。
+				"rescore_query": map[string]interface{}{
+					// match 对正文再次匹配。
+					"match": map[string]interface{}{
+						// text_content 是需要重排的正文字段。
+						"text_content": map[string]interface{}{
+							// query 使用清洗后的搜索词。
+							"query": normalized,
+							// operator=and 表示尽量要求分词后的词都出现。
+							"operator": "and",
+						},
+					},
+				},
+				// query_weight 降低原始查询分数权重。
+				"query_weight": 0.2,
+				// rescore_query_weight 提高重排查询权重。
+				"rescore_query_weight": 1.0,
+			},
+		},
+		// size 控制最终返回条数。
+		"size": topK,
+	}
+
+	// 执行第一次文本搜索。
+	esResponse, err := s.runTextSearch(ctx, esQuery)
+	// 如果 ES 查询失败，直接把错误返回给上层。
+	if err != nil {
+		return nil, err
+	}
+
+	// 如果第一次没有命中，并且存在核心短语，则用核心短语再查一次。
+	if len(esResponse.Hits.Hits) == 0 && phrase != "" && phrase != originalQuery {
+		// 记录短语重试，方便分析为什么第一次没有命中。
+		log.Infof("[SearchService] 文本降级搜索 0 命中，使用核心短语重试: '%s'", phrase)
+		// 把主查询 must 条件里的搜索词替换为核心短语。
+		((esQuery["query"].(map[string]interface{}))["bool"].(map[string]interface{}))["must"] = map[string]interface{}{
+			// match 仍然使用全文检索。
+			"match": map[string]interface{}{
+				// text_content 改成匹配核心短语。
+				"text_content": phrase,
+			},
+		}
+		// 把二次排序里的搜索词也替换为核心短语，保持主查询和重排一致。
+		((esQuery["rescore"].(map[string]interface{}))["query"].(map[string]interface{}))["rescore_query"] = map[string]interface{}{
+			// match 对正文做重排匹配。
+			"match": map[string]interface{}{
+				// text_content 是重排字段。
+				"text_content": map[string]interface{}{
+					// query 使用核心短语。
+					"query": phrase,
+					// operator=and 保持较严格的重排匹配。
+					"operator": "and",
+				},
+			},
+		}
+
+		// 使用修改后的 DSL 执行第二次文本搜索。
+		esResponse, err = s.runTextSearch(ctx, esQuery)
+		// 重试查询失败时返回错误。
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// 如果重试后仍然没有命中，返回空切片，方便前端直接遍历。
+	if len(esResponse.Hits.Hits) == 0 {
+		return []model.SearchResponseDTO{}, nil
+	}
+
+	// 把 ES 命中结果转换成前端需要的 DTO。
+	return s.assembleSearchResults(esResponse.Hits.Hits)
+}
+
+// runTextSearch 负责把文本搜索 DSL 发给 Elasticsearch，并解析成统一响应结构。
+func (s *searchService) runTextSearch(ctx context.Context, esQuery map[string]interface{}) (*esSearchResponse, error) {
+	// buf 用来保存 JSON 编码后的 ES 请求体。
+	var buf bytes.Buffer
+	// 把 map 形式的 DSL 编码为 JSON。
+	if err := json.NewEncoder(&buf).Encode(esQuery); err != nil {
+		// 记录序列化失败原因。
+		log.Errorf("[SearchService] 序列化文本搜索查询失败: %v", err)
+		// 返回带上下文的错误。
+		return nil, fmt.Errorf("failed to encode text search query: %w", err)
+	}
+
+	// 打印最终发给 ES 的文本搜索 DSL，方便调试查询条件。
+	log.Infof("[SearchService] 文本搜索 Elasticsearch 查询语句: %s", buf.String())
+
+	// 调用 Elasticsearch Search API。
+	res, err := s.esClient.Search(
+		// 透传请求上下文，支持超时和取消。
+		s.esClient.Search.WithContext(ctx),
+		// knowledge_base 是知识库索引。
+		s.esClient.Search.WithIndex("knowledge_base"),
+		// 使用刚才编码好的 JSON 请求体。
+		s.esClient.Search.WithBody(&buf),
+		// 要求 ES 统计总命中数，便于调试。
+		s.esClient.Search.WithTrackTotalHits(true),
+	)
+	// 如果请求 ES 本身失败，直接返回。
+	if err != nil {
+		// 记录 ES 客户端错误。
+		log.Errorf("[SearchService] 文本搜索请求 Elasticsearch 失败: %v", err)
+		// 包装错误返回上层。
+		return nil, fmt.Errorf("elasticsearch text search failed: %w", err)
+	}
+	// 方法结束时关闭响应体，避免连接泄漏。
+	defer res.Body.Close()
+
+	// 如果 ES 返回 4xx/5xx，需要读取响应体看具体错误。
+	if res.IsError() {
+		// 读取 ES 错误响应正文。
+		bodyBytes, _ := io.ReadAll(res.Body)
+		// 打印状态码和错误正文。
+		log.Errorf("[SearchService] 文本搜索 Elasticsearch 返回错误, status: %s, body: %s", res.Status(), string(bodyBytes))
+		// 返回 ES 错误状态。
+		return nil, fmt.Errorf("elasticsearch returned an error: %s", res.String())
+	}
+
+	// esResponse 保存解析后的 ES 响应。
+	var esResponse esSearchResponse
+	// 把 ES JSON 响应解析成 Go 结构体。
+	if err := json.NewDecoder(res.Body).Decode(&esResponse); err != nil {
+		// 记录解析失败原因。
+		log.Errorf("[SearchService] 解析文本搜索响应失败: %v", err)
+		// 返回解析错误。
+		return nil, fmt.Errorf("failed to decode text search response: %w", err)
+	}
+
+	// 返回解析后的 ES 响应。
+	return &esResponse, nil
+}
+
+func (s *searchService) assembleSearchResults(hits []esSearchHit) ([]model.SearchResponseDTO, error) {
 	// fileMD5s 保存 ES 命中片段对应的文件 MD5，后面用它查文件名。
-	fileMD5s := make([]string, 0, len(esResponse.Hits.Hits))
+	fileMD5s := make([]string, 0, len(hits))
 	// 遍历所有命中片段。
-	for _, hit := range esResponse.Hits.Hits {
+	for _, hit := range hits {
 		// 收集每个片段所在文件的 MD5。
 		fileMD5s = append(fileMD5s, hit.Source.FileMD5)
 	}
@@ -330,9 +501,9 @@ func (s *searchService) HybridSearch(ctx context.Context, query string, topK int
 	}
 
 	// results 是最终返回给前端的搜索结果 DTO 列表。
-	results := make([]model.SearchResponseDTO, 0, len(esResponse.Hits.Hits))
+	results := make([]model.SearchResponseDTO, 0, len(hits))
 	// 遍历每一条 ES 命中片段。
-	for _, hit := range esResponse.Hits.Hits {
+	for _, hit := range hits {
 		// 根据片段的 fileMD5 找到对应的文件名。
 		fileName := fileNameMap[hit.Source.FileMD5]
 		// 如果数据库里没有找到文件名，使用兜底名称。
@@ -367,7 +538,6 @@ func (s *searchService) HybridSearch(ctx context.Context, query string, topK int
 
 	log.Infof("[SearchService] 组装最终响应成功，返回 %d 条结果", len(results))
 	return results, nil
-
 }
 
 // normalizeQuery 清洗用户搜索词，并返回用于普通匹配和短语匹配的文本。
@@ -410,6 +580,27 @@ func normalizeQuery(q string) (string, string) {
 
 	// 当前实现普通匹配词和 phrase 都使用清洗后的文本。
 	return kept, kept
+}
+
+// buildPermissionFilter 构建搜索权限过滤条件，混合搜索和文本降级搜索都使用同一套规则。
+func buildPermissionFilter(userID uint, userEffectiveTags []string) map[string]interface{} {
+	// 返回 ES bool filter 结构。
+	return map[string]interface{}{
+		// bool 表示多个权限条件组合。
+		"bool": map[string]interface{}{
+			// should 表示满足任意一个权限条件即可访问。
+			"should": []map[string]interface{}{
+				// 当前用户自己上传的文档可见。
+				{"term": map[string]interface{}{"user_id": userID}},
+				// 全局公开文档可见。
+				{"term": map[string]interface{}{"is_public": true}},
+				// 当前用户有效组织标签命中的文档可见。
+				{"terms": map[string]interface{}{"org_tag": userEffectiveTags}},
+			},
+			// 至少满足一个 should 条件才算有权限。
+			"minimum_should_match": 1,
+		},
+	}
 }
 
 // buildPhraseShould 构建 ES 的短语加权查询。
