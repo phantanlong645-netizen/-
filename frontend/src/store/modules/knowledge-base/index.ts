@@ -273,18 +273,10 @@ export const useKnowledgeBaseStore = defineStore(SetupStoreId.KnowledgeBase, () 
         return;
       }
 
-      // 第 0 片先串行上传，确保后端先创建文件记录并完成类型校验。
-      if (!task.uploadedChunks.includes(0)) {
-        // 上传第 0 个分片。
-        const firstChunkSuccess = await uploadChunk(task, 0);
-        // 第 0 片失败时直接中断。
-        if (!firstChunkSuccess) throw new Error('Chunk 0 upload failed');
-      }
-
       // 保存剩余待上传分片下标。
       const pendingChunkIndexes: number[] = [];
-      // 从第 1 片开始收集，因为第 0 片已经单独处理。
-      for (let i = 1; i < totalChunks; i += 1) {
+      // 收集所有还没有上传成功的分片；后端已支持任意分片先到。
+      for (let i = 0; i < totalChunks; i += 1) {
         // 只收集还没有上传成功的分片。
         if (!task.uploadedChunks.includes(i)) {
           // 把待上传分片下标加入队列。
@@ -292,7 +284,7 @@ export const useKnowledgeBaseStore = defineStore(SetupStoreId.KnowledgeBase, () 
         }
       }
 
-      // 并行上传剩余分片。
+      // 并行上传所有待上传分片。
       await uploadChunksInParallel(task, pendingChunkIndexes);
 
       // 重新获取任务对象，拿到并发上传后的最新状态。

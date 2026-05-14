@@ -122,32 +122,31 @@ func (s *uploadService) UploadChunk(ctx context.Context, fileMD5, fileName strin
 	// 打日志记录当前上传的是哪个文件、哪个分片、哪个用户。
 	log.Infof("[UploadChunk] 开始上传分片，文件MD5: %s, 分片序号: %d, 用户ID: %d", fileMD5, chunkIndex, userID)
 
-	// 只在第 0 个分片校验文件类型，避免每个分片都重复校验。
-	if chunkIndex == 0 {
-		// 获取系统支持的文件类型配置。
-		supportedTypes, _ := s.GetSupportedFileTypes()
-		// 从 map 中取出支持的扩展名列表。
-		extensions, ok := supportedTypes["supportedExtensions"].([]string)
-		// 如果类型断言失败，说明 GetSupportedFileTypes 返回结构不符合预期。
-		if !ok {
-			return nil, 0, errors.New("invalid supported types configuration")
+	// 并行上传时不保证第 0 个分片先到，所以每个分片都先校验文件类型。
+	supportedTypes, _ := s.GetSupportedFileTypes()
+	// 从 map 中取出支持的扩展名列表。
+	extensions, ok := supportedTypes["supportedExtensions"].([]string)
+	// 如果类型断言失败，说明 GetSupportedFileTypes 返回结构不符合预期。
+	if !ok {
+		return nil, 0, errors.New("invalid supported types configuration")
+	}
+	// isValid 用来标记当前文件后缀是否合法。
+	isValid := false
+	// 统一转小写后判断文件名后缀，避免 PDF/pdf 大小写问题。
+	lowerFileName := strings.ToLower(fileName)
+	// 遍历所有允许的扩展名。
+	for _, ext := range extensions {
+		// 判断当前文件名是否以允许的扩展名结尾。
+		if strings.HasSuffix(lowerFileName, ext) {
+			// 找到匹配后缀，说明文件类型允许上传。
+			isValid = true
+			// 已经匹配成功，不需要继续遍历。
+			break
 		}
-		// isValid 用来标记当前文件后缀是否合法。
-		isValid := false
-		// 遍历所有允许的扩展名。
-		for _, ext := range extensions {
-			// 转小写后判断文件名后缀，避免 PDF/pdf 大小写问题。
-			if strings.HasSuffix(strings.ToLower(fileName), ext) {
-				// 找到匹配后缀，说明文件类型允许上传。
-				isValid = true
-				// 已经匹配成功，不需要继续遍历。
-				break
-			}
-		}
-		// 如果后缀不在白名单里，直接拒绝上传。
-		if !isValid {
-			return nil, 0, fmt.Errorf("unsupported file type for %s", fileName)
-		}
+	}
+	// 如果后缀不在白名单里，直接拒绝上传，不创建上传记录，也不写 MinIO。
+	if !isValid {
+		return nil, 0, fmt.Errorf("unsupported file type for %s", fileName)
 	}
 
 	// 查询这个文件是否已经有上传主记录。
