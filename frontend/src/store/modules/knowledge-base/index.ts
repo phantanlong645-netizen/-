@@ -171,6 +171,26 @@ export const useKnowledgeBaseStore = defineStore(SetupStoreId.KnowledgeBase, () 
     // 计算文件 MD5，用于前后端识别同一个文件。
     const md5 = await calculateMD5(file);
 
+    // 上传前先问后端当前用户是否已经有这个文件，避免重复上传或丢失断点续传进度。
+    const { error: checkError, data: checkResult } = await request<Api.KnowledgeBase.CheckFileResult>({
+      // 后端根据 MD5 返回 completed 和已上传分片列表。
+      url: '/upload/check',
+      // 检查接口使用 POST，请求体只需要文件 MD5。
+      method: 'POST',
+      // md5 对应后端 CheckFileRequest.MD5。
+      data: { md5 }
+    });
+    // 检查失败时无法确认秒传和续传状态，直接中断本次入队。
+    if (checkError) return;
+
+    // 如果后端确认文件已经完整上传过，就不再创建本地上传任务。
+    if (checkResult.completed) {
+      // 展示文件已存在提示。
+      window.$message?.error('文件已存在');
+      // 结束本次上传入口。
+      return;
+    }
+
     // 检查本地任务队列里是否已经有相同文件。
     const existingTask = tasks.value.find(t => t.fileMd5 === md5);
     // 如果已有相同文件任务，需要根据状态决定如何处理。
@@ -196,6 +216,13 @@ export const useKnowledgeBaseStore = defineStore(SetupStoreId.KnowledgeBase, () 
       }
     }
 
+    // 根据后端返回的已上传分片初始化续传进度。
+    const uploadedChunks = mergeUploadedChunks([], checkResult.uploadedChunks ?? []);
+    // 根据文件大小计算总分片数。
+    const totalChunks = Math.ceil(file.size / chunkSize);
+    // 根据后端已有分片计算初始进度。
+    const progress = Number.parseFloat(((uploadedChunks.length / totalChunks) * 100).toFixed(2));
+
     // 创建新的上传任务对象。
     const newTask: Api.KnowledgeBase.UploadTask = {
       // 原始文件对象。
@@ -214,10 +241,10 @@ export const useKnowledgeBaseStore = defineStore(SetupStoreId.KnowledgeBase, () 
       public: form.isPublic,
       // 当前使用字段：是否公开。
       isPublic: form.isPublic,
-      // 已上传完成的分片下标列表。
-      uploadedChunks: [],
-      // 上传进度百分比。
-      progress: 0,
+      // 已上传完成的分片下标列表，来自后端 /upload/check，用于断点续传。
+      uploadedChunks,
+      // 上传进度百分比，按后端已有分片初始化。
+      progress,
       // 初始状态为等待上传。
       status: UploadStatus.Pending,
       // 文件合并后才会进入后台知识库处理；上传阶段先标记为等待处理。

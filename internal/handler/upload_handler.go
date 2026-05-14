@@ -53,8 +53,12 @@ func (h *UploadHandler) CheckFile(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"completed":      completed,
-		"uploadedChunks": uploadedChunks,
+		"code":    http.StatusOK,
+		"message": "文件检查成功",
+		"data": gin.H{
+			"completed":      completed,
+			"uploadedChunks": uploadedChunks,
+		},
 	})
 }
 

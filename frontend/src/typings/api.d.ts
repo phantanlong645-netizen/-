@@ -163,6 +163,11 @@ declare namespace Api {
       totalChunks: number;
     }
 
+    interface CheckFileResult {
+      completed: boolean;
+      uploadedChunks: number[];
+    }
+
     interface Result {
       objectUrl: string;
       fileSize: number;
