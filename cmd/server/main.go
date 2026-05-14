@@ -64,7 +64,7 @@ func main() {
 	_ = docVectorRepo
 	userService := service.NewUserService(userRepository, orgTagRepo, jwtManager)
 	adminService := service.NewAdminService(orgTagRepo, userRepository, conversationRepo)
-	uploadService := service.NewUploadService(uploadRepo, userRepository, cfg.MinIO)
+	uploadService := service.NewUploadService(uploadRepo, userRepository, orgTagRepo, cfg.MinIO)
 	documentService := service.NewDocumentService(uploadRepo, userRepository, userService, orgTagRepo, docVectorRepo, cfg.MinIO, cfg.Elasticsearch, tikaClient)
 	searchService := service.NewSearchService(embeddingClient, es.ESClient, userService, uploadRepo)
 	conversationService := service.NewConversationService(conversationRepo)

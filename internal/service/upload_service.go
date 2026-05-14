@@ -55,18 +55,22 @@ type uploadService struct {
 	uploadRepo repository.UploadRepository
 	// userRepo 用来在没有传 orgTag 时查询用户主组织。
 	userRepo repository.UserRepository
+	// orgTagRepo 用来校验上传文件归属的组织标签是否存在。
+	orgTagRepo repository.OrgTagRepository
 	// minioCfg 保存 MinIO bucket 等配置，业务层上传和合并文件时要用。
 	minioCfg config.MinIOConfig
 }
 
 // NewUploadService 创建上传业务对象，并把依赖注入进来。
-func NewUploadService(uploadRepo repository.UploadRepository, userRepo repository.UserRepository, minioCfg config.MinIOConfig) UploadService {
+func NewUploadService(uploadRepo repository.UploadRepository, userRepo repository.UserRepository, orgTagRepo repository.OrgTagRepository, minioCfg config.MinIOConfig) UploadService {
 	// 返回接口类型，外部只依赖 UploadService，不直接依赖 uploadService 结构体。
 	return &uploadService{
 		// 保存上传仓储，后面所有数据库和 Redis 操作都通过它完成。
 		uploadRepo: uploadRepo,
 		// 保存用户仓储，用来补全用户组织信息。
 		userRepo: userRepo,
+		// 保存组织标签仓储，用来阻止不存在的 orgTag 被写进文件记录。
+		orgTagRepo: orgTagRepo,
 		// 保存 MinIO 配置，用来确定文件存到哪个 bucket。
 		minioCfg: minioCfg,
 	}
@@ -162,6 +166,13 @@ func (s *uploadService) UploadChunk(ctx context.Context, fileMD5, fileName strin
 			}
 			// 使用用户主组织作为文件组织标签。
 			orgTag = user.PrimaryOrg
+		}
+		// 校验最终使用的组织标签必须存在，避免脏 orgTag 写入 file_uploads。
+		if _, tagErr := s.orgTagRepo.FindByID(orgTag); tagErr != nil {
+			if errors.Is(tagErr, gorm.ErrRecordNotFound) {
+				return nil, 0, fmt.Errorf("organization tag not found: %s", orgTag)
+			}
+			return nil, 0, tagErr
 		}
 
 		// 构造文件上传主记录。
