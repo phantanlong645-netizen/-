@@ -212,12 +212,23 @@ func BulkIndexDocuments(ctx context.Context, indexName string, docs []model.EsDo
 	return nil
 }
 
-// DeleteByFileMD5 删除某个文件在 Elasticsearch 中的所有分块索引。
-func DeleteByFileMD5(ctx context.Context, indexName string, fileMD5 string) error {
+// DeleteByFileMD5AndUserID 删除某个用户某个文件在 Elasticsearch 中的所有分块索引。
+func DeleteByFileMD5AndUserID(ctx context.Context, indexName string, fileMD5 string, userID uint) error {
 	query := map[string]interface{}{
 		"query": map[string]interface{}{
-			"term": map[string]interface{}{
-				"file_md5": fileMD5,
+			"bool": map[string]interface{}{
+				"filter": []map[string]interface{}{
+					{
+						"term": map[string]interface{}{
+							"file_md5": fileMD5,
+						},
+					},
+					{
+						"term": map[string]interface{}{
+							"user_id": userID,
+						},
+					},
+				},
 			},
 		},
 	}
@@ -241,7 +252,7 @@ func DeleteByFileMD5(ctx context.Context, indexName string, fileMD5 string) erro
 	defer res.Body.Close()
 
 	if res.IsError() {
-		log.Errorf("从 Elasticsearch 删除文件索引失败，fileMD5: %s, response: %s", fileMD5, res.String())
+		log.Errorf("从 Elasticsearch 删除文件索引失败，fileMD5: %s, userID: %d, response: %s", fileMD5, userID, res.String())
 		return errors.New("failed to delete document from elasticsearch")
 	}
 

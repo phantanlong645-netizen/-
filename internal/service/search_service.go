@@ -459,21 +459,36 @@ func (s *searchService) runTextSearch(ctx context.Context, esQuery map[string]in
 	return &esResponse, nil
 }
 
+func uploadRecordKey(fileMD5 string, userID uint) string {
+	return fmt.Sprintf("%s:%d", fileMD5, userID)
+}
+
 func (s *searchService) assembleSearchResults(hits []esSearchHit) ([]model.SearchResponseDTO, error) {
 	// fileMD5s 保存 ES 命中片段对应的文件 MD5，后面用它查文件名。
 	fileMD5s := make([]string, 0, len(hits))
+	// userIDs 保存 ES 命中片段对应的上传用户 ID，和 fileMD5 一起定位上传记录。
+	userIDs := make([]uint, 0, len(hits))
 	// 遍历所有命中片段。
 	for _, hit := range hits {
 		// 收集每个片段所在文件的 MD5。
 		fileMD5s = append(fileMD5s, hit.Source.FileMD5)
+		// 收集每个片段所属上传用户。
+		userIDs = append(userIDs, hit.Source.UserID)
 	}
 
 	// uniqueMD5s 用 map 去重，避免同一个文件被重复查询。
 	uniqueMD5s := make(map[string]struct{})
+	// uniqueUserIDs 用 map 去重，避免同一个用户 ID 被重复查询。
+	uniqueUserIDs := make(map[uint]struct{})
 	// 遍历原始 MD5 列表。
 	for _, md5 := range fileMD5s {
 		// 空结构体不占额外业务含义，只表示这个 MD5 出现过。
 		uniqueMD5s[md5] = struct{}{}
+	}
+	// 遍历原始用户 ID 列表。
+	for _, userID := range userIDs {
+		// 空结构体不占额外业务含义，只表示这个用户 ID 出现过。
+		uniqueUserIDs[userID] = struct{}{}
 	}
 
 	// md5List 是去重后的 MD5 切片，方便传给仓储批量查询。
@@ -483,29 +498,36 @@ func (s *searchService) assembleSearchResults(hits []esSearchHit) ([]model.Searc
 		// 把 map key 转成切片元素。
 		md5List = append(md5List, md5)
 	}
+	// userIDList 是去重后的用户 ID 切片，方便传给仓储批量查询。
+	userIDList := make([]uint, 0, len(uniqueUserIDs))
+	// 遍历去重 map。
+	for userID := range uniqueUserIDs {
+		// 把 map key 转成切片元素。
+		userIDList = append(userIDList, userID)
+	}
 
-	// 根据命中的文件 MD5 批量查询文件上传记录，主要是拿文件名。
-	fileInfos, err := s.uploadRepo.FindBatchByMD5s(md5List)
+	// 根据命中的文件 MD5 + userID 批量查询文件上传记录，主要是拿文件名。
+	fileInfos, err := s.uploadRepo.FindBatchByMD5sAndUserIDs(md5List, userIDList)
 	// 文件元数据查询失败时，搜索结果无法完整展示文件名，因此返回错误。
 	if err != nil {
 		log.Errorf("[SearchService] 批量查询文件信息失败: %v", err)
 		return nil, fmt.Errorf("批量查询文件信息失败: %w", err)
 	}
 
-	// fileNameMap 建立 fileMD5 -> fileName 的映射，方便后面 O(1) 取文件名。
+	// fileNameMap 建立 fileMD5:userID -> fileName 的映射，避免同 MD5 不同用户拿错文件名。
 	fileNameMap := make(map[string]string)
 	// 遍历数据库查到的文件记录。
 	for _, info := range fileInfos {
-		// 以文件 MD5 为 key 保存文件名。
-		fileNameMap[info.FileMD5] = info.FileName
+		// 以文件 MD5 + userID 为 key 保存文件名。
+		fileNameMap[uploadRecordKey(info.FileMD5, info.UserID)] = info.FileName
 	}
 
 	// results 是最终返回给前端的搜索结果 DTO 列表。
 	results := make([]model.SearchResponseDTO, 0, len(hits))
 	// 遍历每一条 ES 命中片段。
 	for _, hit := range hits {
-		// 根据片段的 fileMD5 找到对应的文件名。
-		fileName := fileNameMap[hit.Source.FileMD5]
+		// 根据片段的 fileMD5 + userID 找到对应的文件名。
+		fileName := fileNameMap[uploadRecordKey(hit.Source.FileMD5, hit.Source.UserID)]
 		// 如果数据库里没有找到文件名，使用兜底名称。
 		if fileName == "" {
 			log.Warnf("[SearchService] 未找到 FileMD5 '%s' 对应的文件名，将使用 '未知文件'", hit.Source.FileMD5)

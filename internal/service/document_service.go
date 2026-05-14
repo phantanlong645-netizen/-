@@ -137,11 +137,11 @@ func (s *documentService) DeleteDocument(fileMD5 string, user *model.User) error
 		return errors.New("没有权限删除此文件")
 	}
 
-	if err := es.DeleteByFileMD5(context.Background(), s.esCfg.IndexName, fileMD5); err != nil {
+	if err := es.DeleteByFileMD5AndUserID(context.Background(), s.esCfg.IndexName, fileMD5, record.UserID); err != nil {
 		return err
 	}
 
-	if err := s.docVectorRepo.DeleteByFileMD5(fileMD5); err != nil {
+	if err := s.docVectorRepo.DeleteByFileMD5AndUserID(fileMD5, record.UserID); err != nil {
 		return err
 	}
 

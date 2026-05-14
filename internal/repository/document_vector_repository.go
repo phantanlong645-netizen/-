@@ -8,9 +8,9 @@ import (
 
 type DocumentVectorRepository interface {
 	BatchCreate(vectors []*model.DocumentVector) error
-	ReplaceByFileMD5(fileMD5 string, vectors []*model.DocumentVector) error
+	ReplaceByFileMD5AndUserID(fileMD5 string, userID uint, vectors []*model.DocumentVector) error
 	FindByFileMD5(fileMD5 string) ([]*model.DocumentVector, error)
-	DeleteByFileMD5(fileMD5 string) error
+	DeleteByFileMD5AndUserID(fileMD5 string, userID uint) error
 }
 
 type documentVectorRepository struct {
@@ -29,9 +29,9 @@ func (r *documentVectorRepository) BatchCreate(vectors []*model.DocumentVector) 
 	return r.db.CreateInBatches(vectors, 100).Error
 }
 
-func (r *documentVectorRepository) ReplaceByFileMD5(fileMD5 string, vectors []*model.DocumentVector) error {
+func (r *documentVectorRepository) ReplaceByFileMD5AndUserID(fileMD5 string, userID uint, vectors []*model.DocumentVector) error {
 	return r.db.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Where("file_md5 = ?", fileMD5).Delete(&model.DocumentVector{}).Error; err != nil {
+		if err := tx.Where("file_md5 = ? AND user_id = ?", fileMD5, userID).Delete(&model.DocumentVector{}).Error; err != nil {
 			return err
 		}
 
@@ -50,6 +50,6 @@ func (r *documentVectorRepository) FindByFileMD5(fileMD5 string) ([]*model.Docum
 	return vectors, err
 }
 
-func (r *documentVectorRepository) DeleteByFileMD5(fileMD5 string) error {
-	return r.db.Where("file_md5 = ?", fileMD5).Delete(&model.DocumentVector{}).Error
+func (r *documentVectorRepository) DeleteByFileMD5AndUserID(fileMD5 string, userID uint) error {
+	return r.db.Where("file_md5 = ? AND user_id = ?", fileMD5, userID).Delete(&model.DocumentVector{}).Error
 }

@@ -43,8 +43,8 @@ type UploadRepository interface {
 	// 更新整条文件上传记录。
 	UpdateFileUploadRecord(record *model.FileUpload) error
 
-	// 根据多个 MD5 批量查询文件记录，后面搜索结果补文件名会用。
-	FindBatchByMD5s(md5s []string) ([]*model.FileUpload, error)
+	// 根据多个 MD5 和用户 ID 批量查询文件记录，后面搜索结果补文件名会用。
+	FindBatchByMD5sAndUserIDs(md5s []string, userIDs []uint) ([]*model.FileUpload, error)
 
 	// 创建分片记录，写 MySQL 的 chunk_info 表。
 	CreateChunkInfoRecord(record *model.ChunkInfo) error
@@ -111,17 +111,17 @@ func (r *uploadRepository) GetFileUploadRecord(fileMD5 string, userID uint) (*mo
 	return &record, nil
 }
 
-// FindBatchByMD5s 根据多个 MD5 批量查询文件记录。
-// 搜索服务拿到 ES 命中结果后，需要根据 file_md5 批量查文件名。
-func (r *uploadRepository) FindBatchByMD5s(md5s []string) ([]*model.FileUpload, error) {
+// FindBatchByMD5sAndUserIDs 根据多个 MD5 和用户 ID 批量查询文件记录。
+// 搜索服务拿到 ES 命中结果后，需要根据 file_md5 + user_id 批量查文件名。
+func (r *uploadRepository) FindBatchByMD5sAndUserIDs(md5s []string, userIDs []uint) ([]*model.FileUpload, error) {
 	var records []*model.FileUpload
 
-	if len(md5s) == 0 {
+	if len(md5s) == 0 || len(userIDs) == 0 {
 		return records, nil
 	}
 
 	err := r.db.
-		Where("file_md5 IN ?", md5s).
+		Where("file_md5 IN ? AND user_id IN ?", md5s, userIDs).
 		Find(&records).
 		Error
 

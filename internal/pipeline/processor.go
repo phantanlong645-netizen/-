@@ -132,7 +132,7 @@ func (p *Processor) Process(ctx context.Context, task tasks.FileProcessingTask) 
 		})
 	}
 
-	if err := p.docVectorRepo.ReplaceByFileMD5(task.FileMD5, dbVectors); err != nil {
+	if err := p.docVectorRepo.ReplaceByFileMD5AndUserID(task.FileMD5, task.UserID, dbVectors); err != nil {
 		log.Errorf("[Processor] 阶段一: 批量保存文本分块到数据库失败, Error: %v", err)
 		return fmt.Errorf("批量保存文本分块失败: %w", err)
 	}
@@ -243,8 +243,8 @@ func (p *Processor) buildEsDocumentsWithConcurrentEmbedding(ctx context.Context,
 					index: index,
 					// doc 是准备写入 Elasticsearch 的分块文档。
 					doc: model.EsDocument{
-						// VectorID 作为 ES document ID，保证重试时同一 chunk 会覆盖而不是重复。
-						VectorID: fmt.Sprintf("%s_%d", docVector.FileMD5, docVector.ChunkID),
+						// VectorID 作为 ES document ID，带上 userID，保证同 MD5 不同用户互不覆盖。
+						VectorID: fmt.Sprintf("%s_%d_%d", docVector.FileMD5, docVector.UserID, docVector.ChunkID),
 						// FileMD5 标识当前 chunk 属于哪个原始文件。
 						FileMD5: docVector.FileMD5,
 						// ChunkID 是当前文本分块编号。
