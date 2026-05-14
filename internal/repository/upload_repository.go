@@ -189,7 +189,7 @@ func (r *uploadRepository) FindFilesByUserID(userID uint) ([]model.FileUpload, e
 }
 
 // FindAccessibleFiles 查询用户能访问的文件。
-// 条件是：文件已完成，并且满足自己上传、公开文件、组织内公开文件之一。
+// 条件是：文件已完成，并且满足自己上传、公开文件、组织标签命中文件之一。
 func (r *uploadRepository) FindAccessibleFiles(userID uint, orgTags []string) ([]model.FileUpload, error) {
 	var files []model.FileUpload
 
@@ -198,7 +198,7 @@ func (r *uploadRepository) FindAccessibleFiles(userID uint, orgTags []string) ([
 		Where(
 			r.db.Where("user_id = ?", userID).
 				Or("is_public = ?", true).
-				Or("org_tag IN ? AND is_public = ?", orgTags, true),
+				Or("org_tag IN ?", orgTags),
 		).
 		Find(&files).
 		Error

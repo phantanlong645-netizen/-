@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"net/url"
-	"strings"
 	"time"
 
 	"RAG-repository/internal/config"
@@ -49,6 +48,7 @@ type DocumentService interface {
 type documentService struct {
 	uploadRepo    repository.UploadRepository
 	userRepo      repository.UserRepository
+	userService   UserService
 	orgTagRepo    repository.OrgTagRepository
 	docVectorRepo repository.DocumentVectorRepository
 	minioCfg      config.MinIOConfig
@@ -56,10 +56,11 @@ type documentService struct {
 	tikaClient    *tika.Client
 }
 
-func NewDocumentService(uploadRepo repository.UploadRepository, userRepo repository.UserRepository, orgTagRepo repository.OrgTagRepository, docVectorRepo repository.DocumentVectorRepository, minioCfg config.MinIOConfig, esCfg config.ElasticsearchConfig, tikaClient *tika.Client) DocumentService {
+func NewDocumentService(uploadRepo repository.UploadRepository, userRepo repository.UserRepository, userService UserService, orgTagRepo repository.OrgTagRepository, docVectorRepo repository.DocumentVectorRepository, minioCfg config.MinIOConfig, esCfg config.ElasticsearchConfig, tikaClient *tika.Client) DocumentService {
 	return &documentService{
 		uploadRepo:    uploadRepo,
 		userRepo:      userRepo,
+		userService:   userService,
 		orgTagRepo:    orgTagRepo,
 		docVectorRepo: docVectorRepo,
 		minioCfg:      minioCfg,
@@ -69,7 +70,10 @@ func NewDocumentService(uploadRepo repository.UploadRepository, userRepo reposit
 }
 
 func (s *documentService) ListAccessibleFiles(user *model.User) ([]model.FileUpload, error) {
-	orgTags := strings.Split(user.OrgTags, ",")
+	orgTags, err := s.userService.GetUserEffectiveOrgTags(user)
+	if err != nil {
+		return nil, err
+	}
 	return s.uploadRepo.FindAccessibleFiles(user.ID, orgTags)
 }
 func (s *documentService) ListUploadedFiles(userID uint) ([]FileUploadDTO, error) {
