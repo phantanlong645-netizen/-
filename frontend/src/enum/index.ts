@@ -10,7 +10,9 @@ export enum SetupStoreId {
 export enum UploadStatus {
   Uploading = 0,
   Completed = 1,
-  Pending = 2,
-  Paused = 3,
-  Break = 4
+  Merging = 2,
+  Failed = 3,
+  Pending = 10,
+  Paused = 11,
+  Break = 12
 }

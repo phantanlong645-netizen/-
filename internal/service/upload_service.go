@@ -333,6 +333,15 @@ func (s *uploadService) MergeChunks(ctx context.Context, fileMD5, fileName strin
 		log.Errorf("[MergeChunks] 合并分片失败：获取文件记录时出错，error: %v", err)
 		return "", err
 	}
+	if record.Status == model.FileUploadStatusCompleted {
+		destObjectName := storagepath.MergedObjectName(userID, fileMD5, record.FileName)
+		objectURL, _ := storage.GetPresignedURL(s.minioCfg.BucketName, destObjectName, 60*60)
+		log.Infof("[MergeChunks] 文件已合并完成，按幂等成功返回。文件MD5: %s", fileMD5)
+		return objectURL, nil
+	}
+	if record.Status == model.FileUploadStatusMerging {
+		return "", errors.New("文件正在合并中，请稍后重试")
+	}
 
 	// 根据文件总大小计算应该有多少个分片。
 	totalChunks := s.calculateTotalChunks(record.TotalSize)
@@ -348,6 +357,28 @@ func (s *uploadService) MergeChunks(ctx context.Context, fileMD5, fileName strin
 		// 这里必须拒绝，否则 MinIO 合并时会缺对象。
 		log.Warnf("[MergeChunks] 拒绝合并请求：分片未完全上传。文件MD5: %s, 期望分片数: %d, 实际分片数: %d", fileMD5, totalChunks, len(uploadedIndexes))
 		return "", fmt.Errorf("分片未全部上传，无法合并 (期望: %d, 实际: %d)", totalChunks, len(uploadedIndexes))
+	}
+
+	rowsAffected, err := s.uploadRepo.UpdateFileUploadStatusIfCurrent(record.ID, model.FileUploadStatusUploading, model.FileUploadStatusMerging)
+	if err != nil {
+		log.Errorf("[MergeChunks] 更新数据库文件状态为“合并中”失败，error: %v", err)
+		return "", err
+	}
+	if rowsAffected == 0 {
+		latestRecord, findErr := s.uploadRepo.GetFileUploadRecord(fileMD5, userID)
+		if findErr != nil {
+			return "", findErr
+		}
+		if latestRecord.Status == model.FileUploadStatusCompleted {
+			destObjectName := storagepath.MergedObjectName(userID, fileMD5, latestRecord.FileName)
+			objectURL, _ := storage.GetPresignedURL(s.minioCfg.BucketName, destObjectName, 60*60)
+			log.Infof("[MergeChunks] 文件已被其他请求合并完成，按幂等成功返回。文件MD5: %s", fileMD5)
+			return objectURL, nil
+		}
+		if latestRecord.Status == model.FileUploadStatusMerging {
+			return "", errors.New("文件正在合并中，请稍后重试")
+		}
+		return "", errors.New("文件状态已变化，请刷新后重试")
 	}
 
 	// 生成完整文件在 MinIO 里的对象名。
@@ -373,6 +404,7 @@ func (s *uploadService) MergeChunks(ctx context.Context, fileMD5, fileName strin
 		_, err = storage.MinioClient.CopyObject(context.Background(), dst, src)
 		// CopyObject 失败就返回错误。
 		if err != nil {
+			_ = s.uploadRepo.UpdateFileUploadStatus(record.ID, model.FileUploadStatusUploading)
 			log.Errorf("[MergeChunks] 单分片文件复制失败，error: %v", err)
 			return "", fmt.Errorf("failed to copy single chunk object: %w", err)
 		}
@@ -403,6 +435,7 @@ func (s *uploadService) MergeChunks(ctx context.Context, fileMD5, fileName strin
 		_, err = storage.MinioClient.ComposeObject(context.Background(), dst, srcs...)
 		// 合并失败通常是某个分片对象不存在或 MinIO 异常。
 		if err != nil {
+			_ = s.uploadRepo.UpdateFileUploadStatus(record.ID, model.FileUploadStatusUploading)
 			log.Errorf("[MergeChunks] 多分片文件合并失败，error: %v", err)
 			return "", err
 		}

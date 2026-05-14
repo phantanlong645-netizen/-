@@ -28,6 +28,7 @@ type UploadRepository interface {
 
 	// 更新文件上传状态，例如 uploading/completed/failed。
 	UpdateFileUploadStatus(recordID uint, status int) error
+	UpdateFileUploadStatusIfCurrent(recordID uint, currentStatus int, newStatus int) (int64, error)
 	UpdateFileVectorizationStatus(recordID uint, status string, errorMessage string) error
 	UpdateFileVectorizationStatusByMD5AndUserID(fileMD5 string, userID uint, status string, errorMessage string) error
 
@@ -129,13 +130,23 @@ func (r *uploadRepository) FindBatchByMD5sAndUserIDs(md5s []string, userIDs []ui
 }
 
 // UpdateFileUploadStatus 更新文件状态。
-// 例如 0 表示上传中，1 表示已完成，2 表示失败。
+// 例如 0 表示上传中，1 表示已完成，2 表示合并中，3 表示失败。
 func (r *uploadRepository) UpdateFileUploadStatus(recordID uint, status int) error {
 	return r.db.
 		Model(&model.FileUpload{}).
 		Where("id = ?", recordID).
 		Update("status", status).
 		Error
+}
+
+// UpdateFileUploadStatusIfCurrent 只有当前状态符合预期时才更新，用于抢占 merge 权限。
+func (r *uploadRepository) UpdateFileUploadStatusIfCurrent(recordID uint, currentStatus int, newStatus int) (int64, error) {
+	result := r.db.
+		Model(&model.FileUpload{}).
+		Where("id = ? AND status = ?", recordID, currentStatus).
+		Update("status", newStatus)
+
+	return result.RowsAffected, result.Error
 }
 
 // UpdateFileVectorizationStatus updates file vectorization status.

@@ -228,6 +228,8 @@ function handleSearch() {
 // 渲染上传状态
 function renderStatus(status: UploadStatus, percentage: number) {
   if (status === UploadStatus.Completed) return <NTag type="success">已完成</NTag>;
+  else if (status === UploadStatus.Merging) return <NTag type="info">合并中</NTag>;
+  else if (status === UploadStatus.Failed) return <NTag type="error">上传失败</NTag>;
   else if (status === UploadStatus.Break) return <NTag type="error">上传中断</NTag>;
   return <NProgress percentage={percentage} processing />;
 }

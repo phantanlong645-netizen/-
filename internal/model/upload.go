@@ -5,7 +5,8 @@ import "time"
 const (
 	FileUploadStatusUploading = 0
 	FileUploadStatusCompleted = 1
-	FileUploadStatusFailed    = 2
+	FileUploadStatusMerging   = 2
+	FileUploadStatusFailed    = 3
 )
 
 const (
