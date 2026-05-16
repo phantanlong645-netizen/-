@@ -93,8 +93,9 @@ type LogConfig struct {
 }
 
 type KafkaConfig struct {
-	Brokers string `mapstructure:"brokers"`
-	Topic   string `mapstructure:"topic"`
+	Brokers  string `mapstructure:"brokers"`
+	Topic    string `mapstructure:"topic"`
+	DLTTopic string `mapstructure:"dlt_topic"`
 }
 
 type MinIOConfig struct {

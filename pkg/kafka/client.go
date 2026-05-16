@@ -23,12 +23,35 @@ type TaskProcessor interface {
 // producer 是全局 Kafka 生产者。
 var producer *kafka.Writer
 
+// deadLetterProducer 是全局 Kafka 死信生产者。
+var deadLetterProducer *kafka.Writer
+
+// DeadLetterMessage 保存最终无法处理的 Kafka 消息和失败原因。
+type DeadLetterMessage struct {
+	OriginalTopic     string `json:"original_topic"`
+	OriginalPartition int    `json:"original_partition"`
+	OriginalOffset    int64  `json:"original_offset"`
+	FileMD5           string `json:"file_md5,omitempty"`
+	FileName          string `json:"file_name,omitempty"`
+	UserID            uint   `json:"user_id,omitempty"`
+	Attempts          int64  `json:"attempts"`
+	Error             string `json:"error"`
+	Payload           string `json:"payload"`
+	FailedAt          string `json:"failed_at"`
+}
+
 // InitProducer 初始化 Kafka 生产者。
 // 后面文件上传完成后，会通过它发送文件处理任务。
 func InitProducer(cfg config.KafkaConfig) {
 	producer = &kafka.Writer{
 		Addr:     kafka.TCP(cfg.Brokers),
 		Topic:    cfg.Topic,
+		Balancer: &kafka.LeastBytes{},
+	}
+
+	deadLetterProducer = &kafka.Writer{
+		Addr:     kafka.TCP(cfg.Brokers),
+		Topic:    deadLetterTopic(cfg),
 		Balancer: &kafka.LeastBytes{},
 	}
 
@@ -46,6 +69,48 @@ func ProduceFileTask(task tasks.FileProcessingTask) error {
 		context.Background(),
 		kafka.Message{
 			Value: taskBytes,
+		},
+	)
+}
+
+func deadLetterTopic(cfg config.KafkaConfig) string {
+	if cfg.DLTTopic != "" {
+		return cfg.DLTTopic
+	}
+	return cfg.Topic + "-dlt"
+}
+
+func ProduceDeadLetterMessage(original kafka.Message, task *tasks.FileProcessingTask, attempts int64, cause error) error {
+	if deadLetterProducer == nil {
+		return fmt.Errorf("dead letter producer is not initialized")
+	}
+
+	deadLetter := DeadLetterMessage{
+		OriginalTopic:     original.Topic,
+		OriginalPartition: original.Partition,
+		OriginalOffset:    original.Offset,
+		Attempts:          attempts,
+		Error:             trimErrorMessage(cause.Error(), 1000),
+		Payload:           string(original.Value),
+		FailedAt:          time.Now().Format(time.RFC3339),
+	}
+
+	if task != nil {
+		deadLetter.FileMD5 = task.FileMD5
+		deadLetter.FileName = task.FileName
+		deadLetter.UserID = task.UserID
+	}
+
+	deadLetterBytes, err := json.Marshal(deadLetter)
+	if err != nil {
+		return err
+	}
+
+	return deadLetterProducer.WriteMessages(
+		context.Background(),
+		kafka.Message{
+			Key:   original.Key,
+			Value: deadLetterBytes,
 		},
 	)
 }
@@ -101,6 +166,10 @@ func StartConsumer(cfg config.KafkaConfig, processor TaskProcessor) {
 		if err := json.Unmarshal(m.Value, &task); err != nil {
 			// JSON 解析失败说明这条消息格式坏了，重试也大概率没意义。
 			log.Errorf("failed to unmarshal Kafka message: %v, value: %s", err, string(m.Value))
+			if dltErr := ProduceDeadLetterMessage(m, nil, 0, err); dltErr != nil {
+				log.Errorf("failed to send invalid Kafka message to dead letter topic: %v", dltErr)
+				continue
+			}
 
 			// 提交这条坏消息的 offset，避免消费者一直卡在同一条坏消息上。
 			if err := r.CommitMessages(context.Background(), m); err != nil {
@@ -116,9 +185,9 @@ func StartConsumer(cfg config.KafkaConfig, processor TaskProcessor) {
 		log.Infof("start processing file task: md5=%s, fileName=%s", task.FileMD5, task.FileName)
 
 		// 调用真正的文件处理逻辑：下载文件、提取文本、分块、向量化、写 ES。
-		if err := processor.Process(context.Background(), task); err != nil {
+		if processErr := processor.Process(context.Background(), task); processErr != nil {
 			// 处理失败时，先记录失败原因。
-			log.Errorf("file task failed: md5=%s, error=%v", task.FileMD5, err)
+			log.Errorf("file task failed: md5=%s, error=%v", task.FileMD5, processErr)
 
 			// 用 fileMD5 拼出 Redis 失败次数 key。
 			attemptsKey := fmt.Sprintf("kafka:attempts:%s", task.FileMD5)
@@ -138,14 +207,18 @@ func StartConsumer(cfg config.KafkaConfig, processor TaskProcessor) {
 
 			// 如果同一个文件任务已经失败 3 次及以上，就放弃继续重试。
 			if attempts >= 3 {
+				if dltErr := ProduceDeadLetterMessage(m, &task, attempts, processErr); dltErr != nil {
+					log.Errorf("failed to send Kafka message to dead letter topic: md5=%s, error=%v", task.FileMD5, dltErr)
+					continue
+				}
 				// 打印放弃重试并提交 offset 的日志。
-				log.Errorf("file task failed too many times, commit offset: md5=%s", task.FileMD5)
+				log.Errorf("file task failed too many times, sent to dead letter topic and commit offset: md5=%s", task.FileMD5)
 				if err := database.DB.
 					Model(&model.FileUpload{}).
 					Where("file_md5 = ? AND user_id = ?", task.FileMD5, task.UserID).
 					Updates(map[string]interface{}{
 						"vectorization_status":        model.VectorizationStatusFailed,
-						"vectorization_error_message": trimErrorMessage(err.Error(), 1000),
+						"vectorization_error_message": trimErrorMessage(processErr.Error(), 1000),
 					}).
 					Error; err != nil {
 					log.Errorf("failed to mark file upload as failed: md5=%s, userID=%d, error=%v", task.FileMD5, task.UserID, err)

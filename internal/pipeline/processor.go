@@ -7,6 +7,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
+	"strings"
 	"sync"
 	"unicode/utf8"
 
@@ -19,10 +21,19 @@ import (
 	"RAG-repository/pkg/tasks"
 	"RAG-repository/pkg/tika"
 
+	"github.com/go-ego/gse"
 	"github.com/minio/minio-go/v7"
 )
 
 const embeddingWorkerCount = 4
+
+const semanticMinChunkSize = 100
+
+var (
+	chineseSegmenterOnce sync.Once
+	chineseSegmenter     gse.Segmenter
+	chineseSegmenterErr  error
+)
 
 type embeddingJobResult struct {
 	index int
@@ -324,62 +335,543 @@ func (p *Processor) buildEsDocumentsWithConcurrentEmbedding(ctx context.Context,
 }
 
 func (p *Processor) splitText(text string, chunkSize int, chunkOverlap int) []string {
-	// 如果分块大小小于等于重叠大小，step 会小于等于 0，无法正常向前推进。
-	if chunkSize <= chunkOverlap {
-		// 这种异常配置下退回简单切分：只按 chunkSize 切，不做 overlap。
+	// 如果 chunkSize 小于等于 0，说明分块配置无效，直接返回空结果。
+	if chunkSize <= 0 {
+		// 无效配置下不能继续切分，否则 simpleSplit 也可能无法推进。
+		return nil
+	}
+
+	// 去掉文本首尾空白，避免开头或结尾生成空 chunk。
+	text = strings.TrimSpace(text)
+	// 如果清理后没有文本内容，直接返回空结果。
+	if text == "" {
+		// 空文本没有可用于向量化的内容。
+		return nil
+	}
+
+	// 先按段落、句子和词/字符兜底生成基础语义 chunk。
+	baseChunks := p.splitTextIntoBaseChunks(text, chunkSize)
+	// 如果语义切分没有得到任何结果，就退回简单字符切分。
+	if len(baseChunks) == 0 {
+		// 这个兜底避免异常文本格式导致文档完全没有分块。
 		return p.simpleSplit(text, chunkSize)
 	}
 
-	// 保存最终切出来的文本块。
+	// 把过短的 chunk 合并到相邻 chunk，减少无效小片段。
+	mergedChunks := p.mergeSmallChunks(baseChunks, chunkSize, chunkOverlap)
+	// 在相邻 chunk 之间补语义 overlap，让跨块上下文更完整。
+	return p.addSemanticOverlap(mergedChunks, chunkOverlap)
+}
+
+func (p *Processor) splitTextIntoBaseChunks(text string, chunkSize int) []string {
+	// chunks 保存按语义边界切出来的基础分块。
 	var chunks []string
-	// 把字符串转成 rune 切片，按 Unicode 字符切分，避免按字节切坏中文。
-	runes := []rune(text)
-	// 空文本没有可切分内容，直接返回 nil。
-	if len(runes) == 0 {
-		return nil
-	}
+	// paragraphs 按空行切段落，优先保留自然段完整性。
+	paragraphs := p.splitParagraphs(text)
+	// current 保存当前正在累积的 chunk。
+	var current string
 
-	// 每次窗口向前移动的步长；比如 chunkSize=1000、overlap=100，则每次前进 900 个字符。
-	step := chunkSize - chunkOverlap
-
-	// 从文本开头开始，用滑动窗口不断截取 chunk。
-	for i := 0; i < len(runes); i += step {
-		// 当前 chunk 的结束位置，默认取 chunkSize 个字符。
-		end := i + chunkSize
-		// 如果结束位置超过文本长度，就截到文本末尾，避免越界。
-		if end > len(runes) {
-			end = len(runes)
+	// 遍历每一个段落。
+	for _, paragraph := range paragraphs {
+		// 清理段落首尾空白。
+		paragraph = strings.TrimSpace(paragraph)
+		// 跳过空段落。
+		if paragraph == "" {
+			// 空段落不参与切分。
+			continue
 		}
 
-		// 把当前窗口内的 rune 转回字符串，并加入结果列表。
-		chunks = append(chunks, string(runes[i:end]))
-
-		// 如果已经切到文本末尾，说明没有剩余内容，结束循环。
-		if end == len(runes) {
-			break
+		// 如果单个段落已经超过 chunkSize，就进一步按句子切。
+		if p.runeLen(paragraph) > chunkSize {
+			// 当前 chunk 里已有内容时，先把它落盘到结果。
+			if strings.TrimSpace(current) != "" {
+				// 保存当前累积 chunk。
+				chunks = append(chunks, strings.TrimSpace(current))
+				// 清空 current，避免和长段落混在一起。
+				current = ""
+			}
+			// 把长段落拆成更小的句子级 chunk。
+			chunks = append(chunks, p.splitLongParagraph(paragraph, chunkSize)...)
+			// 长段落处理完后继续下一个段落。
+			continue
 		}
+
+		// candidate 是尝试把当前段落合并进 current 后的文本。
+		candidate := p.combineChunks(current, paragraph)
+		// 如果合并后超过 chunkSize，就先保存 current，再用当前段落开新 chunk。
+		if current != "" && p.runeLen(candidate) > chunkSize {
+			// 保存当前 chunk。
+			chunks = append(chunks, strings.TrimSpace(current))
+			// 当前段落作为新 chunk 的起点。
+			current = paragraph
+			// 当前段落已经处理完成。
+			continue
+		}
+
+		// 如果没有超长，就把合并结果作为当前 chunk。
+		current = candidate
 	}
 
-	// 返回所有切好的文本块。
+	// 循环结束后，如果 current 还有内容，需要补进结果。
+	if strings.TrimSpace(current) != "" {
+		// 保存最后一个 chunk。
+		chunks = append(chunks, strings.TrimSpace(current))
+	}
+
+	// 返回基础语义 chunk。
 	return chunks
 }
 
-func (p *Processor) simpleSplit(text string, chunkSize int) []string {
+func (p *Processor) splitLongParagraph(paragraph string, chunkSize int) []string {
+	// chunks 保存长段落按句子切出来的结果。
 	var chunks []string
-	runes := []rune(text)
+	// sentences 按中英文句号、问号、感叹号和分号切句子。
+	sentences := p.splitSentences(paragraph)
+	// current 保存当前正在累积的句子 chunk。
+	var current string
 
-	if len(runes) == 0 {
+	// 遍历长段落里的每个句子。
+	for _, sentence := range sentences {
+		// 清理句子首尾空白。
+		sentence = strings.TrimSpace(sentence)
+		// 跳过空句子。
+		if sentence == "" {
+			// 空句子不参与切分。
+			continue
+		}
+
+		// 如果单句本身超过 chunkSize，就继续按词或字符兜底切。
+		if p.runeLen(sentence) > chunkSize {
+			// 当前 chunk 里已有内容时先保存。
+			if strings.TrimSpace(current) != "" {
+				// 保存当前句子 chunk。
+				chunks = append(chunks, strings.TrimSpace(current))
+				// 清空 current。
+				current = ""
+			}
+			// 拆分超长句子。
+			chunks = append(chunks, p.splitLongSentence(sentence, chunkSize)...)
+			// 超长句子处理完后继续下一个句子。
+			continue
+		}
+
+		// candidate 是尝试把当前句子拼进 current 后的文本。
+		candidate := current + sentence
+		// 如果拼接后超过 chunkSize，就保存 current，再从当前句子开新 chunk。
+		if current != "" && p.runeLen(candidate) > chunkSize {
+			// 保存当前 chunk。
+			chunks = append(chunks, strings.TrimSpace(current))
+			// 当前句子作为新 chunk 起点。
+			current = sentence
+			// 当前句子已经处理完成。
+			continue
+		}
+
+		// 如果没有超长，就把句子拼进 current。
+		current = candidate
+	}
+
+	// 循环结束后保存最后一个句子 chunk。
+	if strings.TrimSpace(current) != "" {
+		// 保存最后的 current。
+		chunks = append(chunks, strings.TrimSpace(current))
+	}
+
+	// 返回长段落切分结果。
+	return chunks
+}
+
+func (p *Processor) splitLongSentence(sentence string, chunkSize int) []string {
+	// 如果句子里有空白分隔，优先按空白词边界切英文或混合文本。
+	if strings.ContainsAny(sentence, " \t\r\n") {
+		// chunks 保存按词边界切出来的结果。
+		var chunks []string
+		// words 提取连续非空白内容和其后空白，尽量保留原始间隔。
+		words := regexp.MustCompile(`\S+\s*`).FindAllString(sentence, -1)
+		// current 保存当前正在累积的词块。
+		var current string
+
+		// 遍历所有词。
+		for _, word := range words {
+			// 如果单个词超过 chunkSize，就用字符兜底切。
+			if p.runeLen(word) > chunkSize {
+				// current 有内容时先保存。
+				if strings.TrimSpace(current) != "" {
+					// 保存当前词块。
+					chunks = append(chunks, strings.TrimSpace(current))
+					// 清空 current。
+					current = ""
+				}
+				// 对超长词做字符切分。
+				chunks = append(chunks, p.simpleSplit(strings.TrimSpace(word), chunkSize)...)
+				// 当前词处理完，继续下一个词。
+				continue
+			}
+
+			// candidate 是尝试加入当前词后的文本。
+			candidate := current + word
+			// 如果加入当前词会超长，就先保存 current，再开启新 chunk。
+			if current != "" && p.runeLen(candidate) > chunkSize {
+				// 保存当前词块。
+				chunks = append(chunks, strings.TrimSpace(current))
+				// 当前词作为新 chunk 起点。
+				current = word
+				// 当前词已经处理完成。
+				continue
+			}
+
+			// 如果没有超长，就继续累积。
+			current = candidate
+		}
+
+		// 保存最后一个词块。
+		if strings.TrimSpace(current) != "" {
+			// 把尾部 current 加入结果。
+			chunks = append(chunks, strings.TrimSpace(current))
+		}
+
+		// 如果词边界切分有结果，就返回。
+		if len(chunks) > 0 {
+			// 返回按词边界切出来的 chunk。
+			return chunks
+		}
+	}
+
+	// 没有明显空白词边界时，优先按中文分词切长句，避免中文只能按单字切。
+	return p.splitChineseSentence(sentence, chunkSize)
+}
+
+func (p *Processor) splitChineseSentence(sentence string, chunkSize int) []string {
+	// chineseSegmenterOnce 保证中文分词器在进程内只初始化一次，避免每个分片重复加载词典。
+	chineseSegmenterOnce.Do(func() {
+		// NewEmbed("zh") 使用 gse 内置中文词典，不依赖外部词典文件。
+		chineseSegmenter, chineseSegmenterErr = gse.NewEmbed("zh")
+	})
+
+	// 如果分词器初始化失败，就退回到 rune 字符切分，保证处理流程不中断。
+	if chineseSegmenterErr != nil {
+		// 记录告警，方便定位词典或依赖初始化问题。
+		log.Warnf("[Processor] 中文分词器初始化失败，使用字符切分兜底。error: %v", chineseSegmenterErr)
+		// 返回按 rune 切分的结果，避免中文被按字节截断。
+		return p.simpleSplit(sentence, chunkSize)
+	}
+
+	// words 是中文分词结果；第二个参数 true 表示启用 HMM，提升未登录词识别能力。
+	words := chineseSegmenter.Cut(sentence, true)
+	// 如果没有切出任何词，就退回到 rune 字符切分。
+	if len(words) == 0 {
+		// 返回字符级兜底结果。
+		return p.simpleSplit(sentence, chunkSize)
+	}
+
+	// chunks 保存按中文词边界组合出来的文本块。
+	var chunks []string
+	// current 保存当前正在累积的文本块。
+	var current string
+
+	// 遍历中文分词结果。
+	for _, word := range words {
+		// 清理词两侧空白；中文词一般没有空白，英文混排时可能会有。
+		word = strings.TrimSpace(word)
+		// 跳过空词，避免生成空 chunk。
+		if word == "" {
+			// 当前词没有业务内容，继续处理下一个词。
+			continue
+		}
+
+		// 如果单个词本身已经超过 chunkSize，就只能继续按 rune 字符兜底切这个词。
+		if p.runeLen(word) > chunkSize {
+			// current 已有内容时，先保存当前 chunk。
+			if strings.TrimSpace(current) != "" {
+				// 保存当前按词累积的 chunk。
+				chunks = append(chunks, strings.TrimSpace(current))
+				// 清空 current，准备处理超长词。
+				current = ""
+			}
+			// 对超长词做字符级切分，避免一个词撑爆 chunkSize。
+			chunks = append(chunks, p.simpleSplit(word, chunkSize)...)
+			// 当前词处理结束，继续下一个词。
+			continue
+		}
+
+		// candidate 是把当前词追加到 current 后的候选 chunk。
+		candidate := current + word
+		// 如果追加当前词会超过 chunkSize，就先保存 current，再用当前词开启新 chunk。
+		if current != "" && p.runeLen(candidate) > chunkSize {
+			// 保存已经达到长度上限附近的 chunk。
+			chunks = append(chunks, strings.TrimSpace(current))
+			// 当前词作为新 chunk 的开头。
+			current = word
+			// 当前词已经放入新 chunk，继续处理下一个词。
+			continue
+		}
+
+		// 没有超长时，继续累积当前词。
+		current = candidate
+	}
+
+	// 循环结束后，如果 current 还有内容，保存最后一个 chunk。
+	if strings.TrimSpace(current) != "" {
+		// 保存尾部 chunk。
+		chunks = append(chunks, strings.TrimSpace(current))
+	}
+
+	// 如果中文分词组合出了结果，就返回这些 chunk。
+	if len(chunks) > 0 {
+		// 返回按中文词边界切出来的结果。
+		return chunks
+	}
+
+	// 理论上不会走到这里；作为兜底，仍然按 rune 字符切分。
+	return p.simpleSplit(sentence, chunkSize)
+}
+
+func (p *Processor) mergeSmallChunks(chunks []string, chunkSize int, chunkOverlap int) []string {
+	// merged 保存合并小块后的结果。
+	var merged []string
+	// minSize 是最小 chunk 长度，过短的 chunk 会尽量和前一个合并。
+	minSize := semanticMinChunkSize
+	// 如果 chunkSize 比默认最小值还小，就以 chunkSize 作为最小值。
+	if chunkSize < minSize {
+		// 避免 minSize 大于 chunkSize 导致所有块都被认为过小。
+		minSize = chunkSize
+	}
+	// maxMergedSize 允许小块合并后略超过 chunkSize，和 Java 的 chunkSize + overlap 类似。
+	maxMergedSize := chunkSize + p.normalizedOverlapSize(chunkSize, chunkOverlap)
+
+	// 遍历基础 chunk。
+	for _, chunk := range chunks {
+		// 清理 chunk 首尾空白。
+		chunk = strings.TrimSpace(chunk)
+		// 跳过空 chunk。
+		if chunk == "" {
+			// 空 chunk 不参与合并。
+			continue
+		}
+
+		// 如果已有前一个 chunk，就尝试合并小块。
+		if len(merged) > 0 {
+			// previous 是上一个已经保存的 chunk。
+			previous := merged[len(merged)-1]
+			// combined 是把前一个 chunk 和当前 chunk 按段落方式合并后的文本。
+			combined := p.combineChunks(previous, chunk)
+			// 如果当前或前一个过短，并且合并后不超过上限，就合并。
+			if (p.runeLen(chunk) < minSize || p.runeLen(previous) < minSize) && p.runeLen(combined) <= maxMergedSize {
+				// 用合并后的文本替换最后一个 chunk。
+				merged[len(merged)-1] = combined
+				// 当前 chunk 已经被合并，不再单独追加。
+				continue
+			}
+		}
+
+		// 无法合并时，当前 chunk 单独加入结果。
+		merged = append(merged, chunk)
+	}
+
+	// 返回合并后的 chunk。
+	return merged
+}
+
+func (p *Processor) addSemanticOverlap(chunks []string, chunkOverlap int) []string {
+	// 如果 overlap 配置无效，直接返回原始 chunks。
+	if chunkOverlap <= 0 {
+		// 不做任何重叠处理。
+		return chunks
+	}
+	// 如果只有 0 或 1 个 chunk，不需要加 overlap。
+	if len(chunks) <= 1 {
+		// 没有相邻 chunk 时无重叠意义。
+		return chunks
+	}
+
+	// overlapped 保存补充语义 overlap 后的结果。
+	overlapped := make([]string, 0, len(chunks))
+	// 第一个 chunk 没有上一个 chunk，所以原样保留。
+	overlapped = append(overlapped, chunks[0])
+
+	// 从第二个 chunk 开始补前文 overlap。
+	for i := 1; i < len(chunks); i++ {
+		// overlapText 从上一个 chunk 末尾按句子边界取上下文。
+		overlapText := p.buildOverlapText(chunks[i-1], chunkOverlap)
+		// 如果没有可用 overlap，就原样追加当前 chunk。
+		if overlapText == "" {
+			// 原样追加当前 chunk。
+			overlapped = append(overlapped, chunks[i])
+			// 继续处理下一个 chunk。
+			continue
+		}
+
+		// 有 overlap 时，把 overlap 放在当前 chunk 前面。
+		overlapped = append(overlapped, overlapText+"\n\n"+chunks[i])
+	}
+
+	// 返回带语义 overlap 的 chunks。
+	return overlapped
+}
+
+func (p *Processor) buildOverlapText(text string, maxLength int) string {
+	// 清理输入文本。
+	text = strings.TrimSpace(text)
+	// 如果文本为空或 overlap 长度无效，返回空字符串。
+	if text == "" || maxLength <= 0 {
+		// 没有可用 overlap。
+		return ""
+	}
+
+	// sentences 把上一个 chunk 拆成句子单元。
+	sentences := p.splitSentences(text)
+	// overlap 保存最终取出的句子级重叠文本。
+	overlap := ""
+
+	// 从最后一句往前取，尽量保持句子完整。
+	for i := len(sentences) - 1; i >= 0; i-- {
+		// sentence 是当前候选句子。
+		sentence := strings.TrimSpace(sentences[i])
+		// 跳过空句子。
+		if sentence == "" {
+			// 空句子不进入 overlap。
+			continue
+		}
+
+		// 如果单句超过 maxLength，只取它的尾部。
+		if p.runeLen(sentence) > maxLength {
+			// 如果 overlap 还为空，就用长句尾部作为 overlap。
+			if overlap == "" {
+				// 返回长句尾部。
+				return p.tailByRuneBoundary(sentence, maxLength)
+			}
+			// 如果已经有 overlap，就保留已有完整句子。
+			return strings.TrimSpace(overlap)
+		}
+
+		// candidate 是把当前句子放到已有 overlap 前面的结果。
+		candidate := sentence + overlap
+		// 如果超过最大 overlap 长度，就停止继续往前取。
+		if p.runeLen(candidate) > maxLength {
+			// 已经达到长度上限。
+			break
+		}
+
+		// 更新 overlap。
+		overlap = candidate
+	}
+
+	// 如果没取到完整句子，就按字符尾部兜底。
+	if strings.TrimSpace(overlap) == "" {
+		// 返回文本尾部。
+		return p.tailByRuneBoundary(text, maxLength)
+	}
+
+	// 返回清理后的 overlap。
+	return strings.TrimSpace(overlap)
+}
+
+func (p *Processor) splitParagraphs(text string) []string {
+	// paragraphRegexp 匹配一个或多个空行，用于识别段落边界。
+	paragraphRegexp := regexp.MustCompile(`\n\s*\n+`)
+	// 按段落边界切分文本。
+	return paragraphRegexp.Split(text, -1)
+}
+
+func (p *Processor) splitSentences(text string) []string {
+	// sentenceRegexp 匹配中英文常见句子结束符，尽量保留结束标点。
+	sentenceRegexp := regexp.MustCompile(`[^。！？；.!?;]+[。！？；.!?;]?`)
+	// sentences 保存匹配出的句子。
+	sentences := sentenceRegexp.FindAllString(text, -1)
+	// 如果正则没有匹配到句子，就把原文本作为一个句子返回。
+	if len(sentences) == 0 {
+		// 返回原文本，避免内容丢失。
+		return []string{text}
+	}
+
+	// 返回句子列表。
+	return sentences
+}
+
+func (p *Processor) combineChunks(first string, second string) string {
+	// 清理第一个 chunk。
+	first = strings.TrimSpace(first)
+	// 清理第二个 chunk。
+	second = strings.TrimSpace(second)
+	// 如果第一个为空，直接返回第二个。
+	if first == "" {
+		// 返回第二个 chunk。
+		return second
+	}
+	// 如果第二个为空，直接返回第一个。
+	if second == "" {
+		// 返回第一个 chunk。
+		return first
+	}
+
+	// 两个 chunk 都有内容时，用空行连接，保留段落感。
+	return first + "\n\n" + second
+}
+
+func (p *Processor) normalizedOverlapSize(chunkSize int, chunkOverlap int) int {
+	// 如果 overlap 配置无效，返回 0。
+	if chunkOverlap <= 0 || chunkSize <= 1 {
+		// 没有可用 overlap。
+		return 0
+	}
+	// 如果 overlap 大于 chunkSize，就限制到 chunkSize-1，避免超过主体长度。
+	if chunkOverlap >= chunkSize {
+		// 返回最大安全 overlap。
+		return chunkSize - 1
+	}
+	// 返回原始 overlap。
+	return chunkOverlap
+}
+
+func (p *Processor) tailByRuneBoundary(text string, maxLength int) string {
+	// 把文本转成 rune，避免按字节截断中文。
+	runes := []rune(strings.TrimSpace(text))
+	// 如果长度本来就不超过上限，直接返回原文本。
+	if len(runes) <= maxLength {
+		// 返回完整文本。
+		return string(runes)
+	}
+	// 从尾部截取 maxLength 个 rune。
+	return string(runes[len(runes)-maxLength:])
+}
+
+func (p *Processor) runeLen(text string) int {
+	// utf8.RuneCountInString 按 Unicode 字符计数，不按字节计数。
+	return utf8.RuneCountInString(text)
+}
+
+func (p *Processor) simpleSplit(text string, chunkSize int) []string {
+	// 如果 chunkSize 无效，直接返回空结果，避免死循环。
+	if chunkSize <= 0 {
+		// 无效配置不能继续切分。
 		return nil
 	}
 
+	// chunks 保存字符兜底切分结果。
+	var chunks []string
+	// 把字符串转成 rune，避免切坏中文字符。
+	runes := []rune(text)
+
+	// 如果文本为空，直接返回空结果。
+	if len(runes) == 0 {
+		// 没有可切分内容。
+		return nil
+	}
+
+	// 按 chunkSize 固定长度兜底切分。
 	for i := 0; i < len(runes); i += chunkSize {
+		// 计算当前 chunk 的结束下标。
 		end := i + chunkSize
+		// 如果结束下标超过文本长度，就截到文本末尾。
 		if end > len(runes) {
+			// 修正结束下标，避免越界。
 			end = len(runes)
 		}
 
+		// 把当前 rune 区间转回字符串并加入结果。
 		chunks = append(chunks, string(runes[i:end]))
 	}
 
+	// 返回兜底切分结果。
 	return chunks
 }
