@@ -1,7 +1,10 @@
 <script setup lang="ts">
 import { NScrollbar } from 'naive-ui';
 import { VueMarkdownItProvider } from 'vue-markdown-shiki';
+import katexPlugin from '@traptitech/markdown-it-katex';
 import ChatMessage from './chat-message.vue';
+
+const mdOptions = { config: (md: any) => md.use(katexPlugin) };
 
 defineOptions({
   name: 'ChatList'
@@ -67,7 +70,7 @@ onMounted(() => {
         </div>
       </Teleport>
       <NSpin :show="loading">
-        <VueMarkdownItProvider>
+        <VueMarkdownItProvider :options="mdOptions">
           <ChatMessage v-for="(item, index) in list" :key="index" :msg="item" />
         </VueMarkdownItProvider>
       </NSpin>

@@ -1,7 +1,10 @@
 <script setup lang="ts">
 import type { NScrollbar } from 'naive-ui';
 import { VueMarkdownItProvider } from 'vue-markdown-shiki';
+import katexPlugin from '@traptitech/markdown-it-katex';
 import ChatMessage from '../chat/modules/chat-message.vue';
+
+const mdOptions = { config: (md: any) => md.use(katexPlugin) };
 
 defineOptions({
   name: 'ChatHistory'
@@ -80,7 +83,7 @@ async function getList() {
     </Teleport>
     <NScrollbar ref="scrollbarRef">
       <NSpin :show="loading" class="h-full">
-        <VueMarkdownItProvider>
+        <VueMarkdownItProvider :options="mdOptions">
           <ChatMessage v-for="(item, index) in list" :key="index" :msg="item" />
         </VueMarkdownItProvider>
         <NEmpty v-if="!list.length" description="暂无数据" class="mt-60" />

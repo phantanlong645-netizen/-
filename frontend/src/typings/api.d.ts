@@ -172,6 +172,56 @@ declare namespace Api {
       objectUrl: string;
       fileSize: number;
     }
+
+    namespace ResearchAgent {
+      interface Session {
+        id: number;
+        userId: number;
+        query: string;
+        plannedQueries: string;
+        status: 'COMPLETED' | 'FAILED';
+        errorMessage?: string;
+        createdAt: string;
+        completedAt?: string | null;
+      }
+
+      interface Candidate {
+        id: number;
+        sessionId: number;
+        userId: number;
+        provider: string;
+        externalId: string;
+        title: string;
+        abstract: string;
+        authors: string;
+        year: number;
+        url: string;
+        pdfUrl: string;
+        citationCount: number;
+        relevanceScore: number;
+        selectionReason: string;
+        importStatus: 'PENDING' | 'IMPORTED' | 'FAILED';
+        fileMd5?: string;
+        importError?: string;
+        createdAt: string;
+        importedAt?: string | null;
+      }
+
+      interface SearchRequest {
+        query: string;
+        limit: number;
+      }
+
+      interface SearchResponse {
+        session: Session;
+        candidates: Candidate[];
+      }
+
+      interface ImportRequest {
+        orgTag: string | null;
+        isPublic: boolean;
+      }
+    }
   }
 
   namespace Chat {

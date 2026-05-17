@@ -1,6 +1,6 @@
 <script setup lang="tsx">
 import type { UploadFileInfo } from 'naive-ui';
-import { NButton, NEllipsis, NModal, NPopconfirm, NProgress, NTag, NUpload } from 'naive-ui';
+import { NButton, NEllipsis, NModal, NPopconfirm, NProgress, NTag, NTooltip, NUpload } from 'naive-ui';
 import { uploadAccept } from '@/constants/common';
 import { fakePaginationRequest } from '@/service/request';
 import { UploadStatus } from '@/enum';
@@ -238,20 +238,39 @@ function renderStatus(status: UploadStatus, percentage: number) {
 function renderVectorizationStatus(row: Api.KnowledgeBase.UploadTask) {
   const status = row.vectorizationStatus || 'PENDING';
   if (status === 'COMPLETED') return <NTag type="success">已入库</NTag>;
-  if (status === 'PROCESSING') return <NTag type="info">处理中</NTag>;
+  if (status === 'PROCESSING') {
+    return (
+      <div class="flex items-center gap-4">
+        <NTag type="info">处理中</NTag>
+        <NButton size="tiny" type="primary" ghost onClick={() => retryVectorization(row)}>
+          重新处理
+        </NButton>
+      </div>
+    );
+  }
   if (status === 'FAILED') {
     return (
       <div class="flex items-center gap-4">
-        <NTag type="error" title={row.vectorizationErrorMessage || '后台处理失败'}>
-          处理失败
-        </NTag>
+        <NTooltip trigger="hover">
+          {{
+            trigger: () => <NTag type="error">处理失败</NTag>,
+            default: () => row.vectorizationErrorMessage || '后台处理失败'
+          }}
+        </NTooltip>
         <NButton size="tiny" type="primary" ghost onClick={() => retryVectorization(row)}>
           重试
         </NButton>
       </div>
     );
   }
-  return <NTag type="warning">等待处理</NTag>;
+  return (
+    <div class="flex items-center gap-4">
+      <NTag type="warning">等待处理</NTag>
+      <NButton size="tiny" type="primary" ghost onClick={() => retryVectorization(row)}>
+        重新处理
+      </NButton>
+    </div>
+  );
 }
 
 async function retryVectorization(row: Api.KnowledgeBase.UploadTask) {

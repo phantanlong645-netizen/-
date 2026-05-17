@@ -20,6 +20,7 @@ type Config struct {
 	Embedding     EmbeddingConfig     `mapstructure:"embedding"`
 	LLM           LLMConfig           `mapstructure:"llm"`
 	AI            AIConfig            `mapstructure:"ai"`
+	ResearchAgent ResearchAgentConfig `mapstructure:"research_agent"`
 }
 type LLMConfig struct {
 	APIKey     string              `mapstructure:"api_key"`
@@ -93,9 +94,10 @@ type LogConfig struct {
 }
 
 type KafkaConfig struct {
-	Brokers  string `mapstructure:"brokers"`
-	Topic    string `mapstructure:"topic"`
-	DLTTopic string `mapstructure:"dlt_topic"`
+	Brokers       string `mapstructure:"brokers"`
+	Topic         string `mapstructure:"topic"`
+	DLTTopic      string `mapstructure:"dlt_topic"`
+	ConsumerCount int    `mapstructure:"consumer_count"`
 }
 
 type MinIOConfig struct {
@@ -122,6 +124,11 @@ type EmbeddingConfig struct {
 	APIKey     string `mapstructure:"api_key"`
 	BaseURL    string `mapstructure:"base_url"`
 	Dimensions int    `mapstructure:"dimensions"`
+}
+
+type ResearchAgentConfig struct {
+	SemanticScholarAPIKey string `mapstructure:"semantic_scholar_api_key"`
+	MaxCandidates         int    `mapstructure:"max_candidates"`
 }
 
 func Init(configPath string) {

@@ -120,6 +120,9 @@ func (s *searchService) HybridSearch(ctx context.Context, query string, topK int
 			"k": topK * 30,
 			// num_candidates 控制近似向量检索参与计算的候选数量。
 			"num_candidates": topK * 30,
+			// filter 对 knn 通道单独施加权限过滤，避免召回无权访问的文档污染排序。
+			// 注意：ES 8.x 中 knn 与 query 是独立通道，query 的 filter 不作用于 knn。
+			"filter": buildPermissionFilter(user.ID, userEffectiveTags),
 		},
 		// query 部分负责文本匹配和权限过滤。
 		"query": map[string]interface{}{

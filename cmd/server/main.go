@@ -4,6 +4,7 @@ import (
 	"RAG-repository/internal/config"
 	"RAG-repository/internal/handler"
 	"RAG-repository/internal/middleware"
+	"RAG-repository/internal/model"
 	"RAG-repository/internal/pipeline"
 	"RAG-repository/internal/repository"
 	"RAG-repository/internal/service"
@@ -34,6 +35,10 @@ func main() {
 
 	database.InitMySQL(cfg.Database.MySQL.DSN)
 	database.InitRedis(cfg.Database.Redis.Addr, cfg.Database.Redis.Password, cfg.Database.Redis.DB)
+	if err := database.DB.AutoMigrate(&model.FileUpload{}, &model.DocumentVector{}, &model.ResearchSession{}, &model.ResearchCandidate{}); err != nil {
+		log.Errorf("database table migration failed: %v", err)
+		return
+	}
 	storage.InitMinIO(cfg.MinIO)
 	if err := es.InitES(cfg.Elasticsearch); err != nil {
 		log.Errorf("es 初始化失败 %s", err)
@@ -45,7 +50,6 @@ func main() {
 	_ = tikaClient
 	_ = embeddingClient
 	llmClient := llm.NewClient(cfg.LLM)
-	_ = llmClient
 	jwtManager := token.NewJWTManager(
 		cfg.JWT.Secret,
 		cfg.JWT.AccessTokenExpireHours,
@@ -57,11 +61,13 @@ func main() {
 	uploadRepo := repository.NewUploadRepository(database.DB, database.RDB)
 	conversationRepo := repository.NewConversationRepository(database.RDB)
 	docVectorRepo := repository.NewDocumentVectorRepository(database.DB)
+	researchRepo := repository.NewResearchRepository(database.DB)
 	_ = userRepository
 	_ = orgTagRepo
 	_ = uploadRepo
 	_ = conversationRepo
 	_ = docVectorRepo
+	_ = researchRepo
 	userService := service.NewUserService(userRepository, orgTagRepo, jwtManager)
 	adminService := service.NewAdminService(orgTagRepo, userRepository, conversationRepo)
 	uploadService := service.NewUploadService(uploadRepo, userRepository, orgTagRepo, cfg.MinIO)
@@ -69,6 +75,7 @@ func main() {
 	searchService := service.NewSearchService(embeddingClient, es.ESClient, userService, uploadRepo)
 	conversationService := service.NewConversationService(conversationRepo)
 	chatService := service.NewChatService(searchService, llmClient, conversationRepo)
+	researchAgentService := service.NewResearchAgentService(researchRepo, uploadRepo, orgTagRepo, cfg.MinIO, cfg.ResearchAgent, llmClient)
 	processor := pipeline.NewProcessor(
 		tikaClient,
 		embeddingClient,
@@ -79,7 +86,13 @@ func main() {
 		docVectorRepo,
 	)
 
-	go kafka.StartConsumer(cfg.Kafka, processor)
+	consumerCount := cfg.Kafka.ConsumerCount
+	if consumerCount <= 0 {
+		consumerCount = 1
+	}
+	for i := 0; i < consumerCount; i++ {
+		go kafka.StartConsumer(cfg.Kafka, processor)
+	}
 
 	if cfg.Server.Mode == "release" {
 		gin.SetMode(gin.ReleaseMode)
@@ -87,7 +100,7 @@ func main() {
 	router := gin.New()
 	router.Use(middleware.RequestLogger(), gin.Recovery())
 
-	registerRoutes(router, userService, adminService, uploadService, documentService, searchService, conversationService, chatService, jwtManager)
+	registerRoutes(router, userService, adminService, uploadService, documentService, searchService, conversationService, chatService, researchAgentService, jwtManager)
 
 	serverAddr := fmt.Sprintf(":%s", cfg.Server.Port)
 	log.Infof("Server starting on %s", serverAddr)
@@ -113,6 +126,7 @@ func registerRoutes(
 	searchService service.SearchService,
 	conversationService service.ConversationService,
 	chatService service.ChatService,
+	researchAgentService service.ResearchAgentService,
 	jwtManager *token.JWTManager,
 ) {
 	r.GET("/health", func(c *gin.Context) {
@@ -171,6 +185,15 @@ func registerRoutes(
 		search.Use(middleware.AuthMiddleware(jwtManager, userService))
 		{
 			search.GET("/hybrid", handler.NewSearchHandler(searchService).HybridSearch)
+		}
+
+		researchAgent := apiV1.Group("/research-agent")
+		researchAgent.Use(middleware.AuthMiddleware(jwtManager, userService))
+		{
+			researchAgentHandler := handler.NewResearchAgentHandler(researchAgentService, userService)
+			researchAgent.POST("/sessions", researchAgentHandler.RunSearch)
+			researchAgent.GET("/sessions/:sessionId/candidates", researchAgentHandler.ListCandidates)
+			researchAgent.POST("/candidates/:candidateId/import", researchAgentHandler.ImportCandidate)
 		}
 
 		conversation := apiV1.Group("/users/conversation")

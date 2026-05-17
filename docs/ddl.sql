@@ -67,6 +67,44 @@ CREATE TABLE document_vectors (
                                   is_public TINYINT(1) NOT NULL DEFAULT 0 COMMENT '文件是否公开'
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='文档向量存储表';
 
+CREATE TABLE research_sessions (
+                                   id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT 'Agent 检索会话 ID',
+                                   user_id BIGINT NOT NULL COMMENT '用户 ID',
+                                   query VARCHAR(1000) NOT NULL COMMENT '用户原始检索问题',
+                                   planned_queries TEXT COMMENT 'Agent 规划出来的检索 query 列表 JSON',
+                                   status VARCHAR(32) NOT NULL COMMENT '会话状态',
+                                   error_message VARCHAR(1000) DEFAULT '' COMMENT '失败原因',
+                                   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+                                   completed_at TIMESTAMP NULL DEFAULT NULL COMMENT '完成时间',
+                                   INDEX idx_research_sessions_user (user_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='Agent 外部检索会话表';
+
+CREATE TABLE research_candidates (
+                                     id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '候选结果 ID',
+                                     session_id BIGINT NOT NULL COMMENT '检索会话 ID',
+                                     user_id BIGINT NOT NULL COMMENT '用户 ID',
+                                     provider VARCHAR(50) NOT NULL COMMENT '来源，例如 semantic_scholar 或 arxiv',
+                                     external_id VARCHAR(255) NOT NULL COMMENT '外部系统 ID',
+                                     title VARCHAR(1000) NOT NULL COMMENT '标题',
+                                     abstract TEXT COMMENT '摘要',
+                                     authors TEXT COMMENT '作者 JSON',
+                                     year INT DEFAULT 0 COMMENT '年份',
+                                     url VARCHAR(1000) DEFAULT '' COMMENT '论文页面地址',
+                                     pdf_url VARCHAR(1000) DEFAULT '' COMMENT 'PDF 地址',
+                                     citation_count INT DEFAULT 0 COMMENT '引用数',
+                                     relevance_score DOUBLE DEFAULT 0 COMMENT 'Agent 相关性分数',
+                                     selection_reason VARCHAR(1000) DEFAULT '' COMMENT '入选原因',
+                                     import_status VARCHAR(32) NOT NULL DEFAULT 'PENDING' COMMENT '导入状态',
+                                     file_md5 VARCHAR(32) DEFAULT '' COMMENT '导入后文件 MD5',
+                                     import_error VARCHAR(1000) DEFAULT '' COMMENT '导入失败原因',
+                                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+                                     imported_at TIMESTAMP NULL DEFAULT NULL COMMENT '导入时间',
+                                     INDEX idx_research_candidates_session (session_id),
+                                     INDEX idx_research_candidates_user (user_id),
+                                     INDEX idx_research_candidate_source (provider, external_id),
+                                     INDEX idx_research_candidates_file_md5 (file_md5)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='Agent 外部检索候选结果表';
+
 
 INSERT INTO users (username, password, role) VALUES ('admin', '$2a$10$CuNbcCAjuZPTu/VnBT/kgeU4Pu.bcEo23GJxvugZt/3yTQ8iIF4hC', 'ADMIN');
 INSERT INTO users (username, password, role) VALUES ('testuser', '$2a$10$zUiAOXogIuHnNyR7vf8Q3usknDJcvmbc.36Kl2iC0gdAWyrecoGZa', 'USER');

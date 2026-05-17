@@ -23,6 +23,7 @@ type MessageWriter interface {
 // Client 定义 LLM 客户端接口。
 // 后面的 chat service 只依赖接口，不依赖具体模型厂商。
 type Client interface {
+	CompleteChatMessages(ctx context.Context, messages []Message, gen *GenerationParams) (string, error)
 	StreamChatMessages(ctx context.Context, messages []Message, gen *GenerationParams, writer MessageWriter) error
 	StreamChat(ctx context.Context, prompt string, writer MessageWriter) error
 }
@@ -64,6 +65,9 @@ type chatResponse struct {
 		Delta struct {
 			Content string `json:"content"`
 		} `json:"delta"`
+		Message struct {
+			Content string `json:"content"`
+		} `json:"message"`
 	} `json:"choices"`
 }
 
@@ -78,6 +82,72 @@ type GenerationParams struct {
 // 内部会把 prompt 包装成一条 user 消息。
 func (c *deepseekClient) StreamChat(ctx context.Context, prompt string, writer MessageWriter) error {
 	return c.StreamChatMessages(ctx, []Message{{Role: "user", Content: prompt}}, nil, writer)
+}
+
+func (c *deepseekClient) CompleteChatMessages(ctx context.Context, messages []Message, gen *GenerationParams) (string, error) {
+	reqBody := c.buildChatRequest(messages, gen, false)
+
+	reqBytes, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal chat request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.cfg.BaseURL+"/chat/completions", bytes.NewReader(reqBytes))
+	if err != nil {
+		return "", fmt.Errorf("failed to create chat request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+c.cfg.APIKey)
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to call chat api: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("chat api returned non-200 status: %s, body: %s", resp.Status, string(bodyBytes))
+	}
+
+	var result chatResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", fmt.Errorf("failed to decode chat response: %w", err)
+	}
+	if len(result.Choices) == 0 {
+		return "", nil
+	}
+	return result.Choices[0].Message.Content, nil
+}
+
+func (c *deepseekClient) buildChatRequest(messages []Message, gen *GenerationParams, stream bool) chatRequest {
+	reqBody := chatRequest{
+		Model:    c.cfg.Model,
+		Messages: messages,
+		Stream:   stream,
+	}
+
+	if gen != nil {
+		reqBody.Temperature = gen.Temperature
+		reqBody.TopP = gen.TopP
+		reqBody.MaxTokens = gen.MaxTokens
+		return reqBody
+	}
+
+	if c.cfg.Generation.Temperature != 0 {
+		t := c.cfg.Generation.Temperature
+		reqBody.Temperature = &t
+	}
+	if c.cfg.Generation.TopP != 0 {
+		p := c.cfg.Generation.TopP
+		reqBody.TopP = &p
+	}
+	if c.cfg.Generation.MaxTokens != 0 {
+		m := c.cfg.Generation.MaxTokens
+		reqBody.MaxTokens = &m
+	}
+	return reqBody
 }
 
 // StreamChatMessages 调用 OpenAI 兼容的 chat completions 流式接口。

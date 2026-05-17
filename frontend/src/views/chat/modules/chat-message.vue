@@ -21,23 +21,30 @@ const sourceFiles = ref<Array<{fileName: string, id: string}>>([]);
 
 // 处理来源文件链接的函数
 function processSourceLinks(text: string): string {
-  // 匹配 (来源#数字: 文件名) 的正则表达式
-  const sourcePattern = /\(来源#(\d+):\s*([^)]+)\)/g;
+  // 匹配 (来源#数字: 文件名) 的正则表达式，同时兼容中文冒号 ：
+  const sourcePattern = /\(来源#(\d+)[：:]\s*([^)]+)\)/g;
 
-  return text.replace(sourcePattern, (_match, sourceNum, fileName) => {
+  // 使用本地数组避免在 computed 内读写同一个 reactive ref（防止循环依赖）
+  const newFiles: Array<{fileName: string, id: string}> = [];
+
+  const result = text.replace(sourcePattern, (_match, sourceNum, fileName) => {
     // 为文件名创建可点击的链接
     const linkClass = 'source-file-link';
     const encodedFileName = encodeURIComponent(fileName.trim());
-    const fileId = `source-file-${sourceFiles.value.length}`;
+    const fileId = `source-file-${newFiles.length}`;
 
-    // 存储文件信息
-    sourceFiles.value.push({
+    // 存储文件信息到本地数组
+    newFiles.push({
       fileName: encodedFileName,
       id: fileId
     });
 
-    return `(来源#${sourceNum}: <span class="${linkClass}" data-file-id="${fileId}">${fileName}</span>)`;
+    return `(来源#${sourceNum}: <span class="${linkClass}" data-file-id="${fileId}">${fileName.trim()}</span>)`;
   });
+
+  // 统一替换 sourceFiles，避免在 replace 回调中直接写 reactive ref
+  sourceFiles.value = newFiles;
+  return result;
 }
 
 const content = computed(() => {

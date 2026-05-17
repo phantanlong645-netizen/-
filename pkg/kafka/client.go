@@ -26,6 +26,11 @@ var producer *kafka.Writer
 // deadLetterProducer 是全局 Kafka 死信生产者。
 var deadLetterProducer *kafka.Writer
 
+const (
+	maxFileTaskAttempts int64 = 3
+	fileTaskTimeout           = 15 * time.Minute
+)
+
 // DeadLetterMessage 保存最终无法处理的 Kafka 消息和失败原因。
 type DeadLetterMessage struct {
 	OriginalTopic     string `json:"original_topic"`
@@ -126,6 +131,17 @@ func trimErrorMessage(message string, maxLength int) string {
 	return message[:maxLength]
 }
 
+func updateFileTaskStatus(task tasks.FileProcessingTask, status string, errorMessage string) error {
+	return database.DB.
+		Model(&model.FileUpload{}).
+		Where("file_md5 = ? AND user_id = ?", task.FileMD5, task.UserID).
+		Updates(map[string]interface{}{
+			"vectorization_status":        status,
+			"vectorization_error_message": errorMessage,
+		}).
+		Error
+}
+
 // StartConsumer ?? Kafka ???,???????????
 func StartConsumer(cfg config.KafkaConfig, processor TaskProcessor) {
 	// 创建 Kafka reader，也就是消费者客户端。
@@ -184,54 +200,46 @@ func StartConsumer(cfg config.KafkaConfig, processor TaskProcessor) {
 		// 打印即将处理的文件任务信息。
 		log.Infof("start processing file task: md5=%s, fileName=%s", task.FileMD5, task.FileName)
 
-		// 调用真正的文件处理逻辑：下载文件、提取文本、分块、向量化、写 ES。
-		if processErr := processor.Process(context.Background(), task); processErr != nil {
-			// 处理失败时，先记录失败原因。
-			log.Errorf("file task failed: md5=%s, error=%v", task.FileMD5, processErr)
-
-			// 用 fileMD5 拼出 Redis 失败次数 key。
-			attemptsKey := fmt.Sprintf("kafka:attempts:%s", task.FileMD5)
-			// 失败次数加 1；这个计数用于限制最多重试几次。
-			attempts, incErr := database.RDB.Incr(context.Background(), attemptsKey).Result()
-			// 如果 Redis 计数成功，给这个失败计数设置 24 小时过期时间。
-			if incErr == nil {
-				// Expire 失败不影响主流程，所以这里忽略返回错误。
-				_ = database.RDB.Expire(context.Background(), attemptsKey, 24*time.Hour).Err()
+		var processErr error
+		processed := false
+		for attempt := int64(1); attempt <= maxFileTaskAttempts; attempt++ {
+			if attempt > 1 {
+				time.Sleep(time.Duration(attempt-1) * 2 * time.Second)
 			}
 
-			// 如果 Redis 失败次数写入失败，当前消息不提交 offset，让 Kafka 后续继续重试。
-			if incErr != nil {
-				// 不 commit，直接进入下一轮循环。
+			taskCtx, cancel := context.WithTimeout(context.Background(), fileTaskTimeout)
+			processErr = processor.Process(taskCtx, task)
+			cancel()
+			if processErr == nil {
+				processed = true
+				break
+			}
+
+			log.Errorf("file task failed: md5=%s, attempt=%d/%d, error=%v", task.FileMD5, attempt, maxFileTaskAttempts, processErr)
+			if attempt < maxFileTaskAttempts {
+				message := fmt.Sprintf("第 %d/%d 次处理失败，等待重试: %s", attempt, maxFileTaskAttempts, trimErrorMessage(processErr.Error(), 900))
+				if err := updateFileTaskStatus(task, model.VectorizationStatusPending, message); err != nil {
+					log.Errorf("failed to mark file upload as pending retry: md5=%s, userID=%d, error=%v", task.FileMD5, task.UserID, err)
+					break
+				}
+			}
+		}
+
+		if !processed {
+			if dltErr := ProduceDeadLetterMessage(m, &task, maxFileTaskAttempts, processErr); dltErr != nil {
+				log.Errorf("failed to send Kafka message to dead letter topic: md5=%s, error=%v", task.FileMD5, dltErr)
 				continue
 			}
 
-			// 如果同一个文件任务已经失败 3 次及以上，就放弃继续重试。
-			if attempts >= 3 {
-				if dltErr := ProduceDeadLetterMessage(m, &task, attempts, processErr); dltErr != nil {
-					log.Errorf("failed to send Kafka message to dead letter topic: md5=%s, error=%v", task.FileMD5, dltErr)
-					continue
-				}
-				// 打印放弃重试并提交 offset 的日志。
-				log.Errorf("file task failed too many times, sent to dead letter topic and commit offset: md5=%s", task.FileMD5)
-				if err := database.DB.
-					Model(&model.FileUpload{}).
-					Where("file_md5 = ? AND user_id = ?", task.FileMD5, task.UserID).
-					Updates(map[string]interface{}{
-						"vectorization_status":        model.VectorizationStatusFailed,
-						"vectorization_error_message": trimErrorMessage(processErr.Error(), 1000),
-					}).
-					Error; err != nil {
-					log.Errorf("failed to mark file upload as failed: md5=%s, userID=%d, error=%v", task.FileMD5, task.UserID, err)
-					continue
-				}
-				// 提交 offset，Kafka 会认为这条消息已经处理完成，不会再投递。
-				if err := r.CommitMessages(context.Background(), m); err != nil {
-					// 如果提交 offset 失败，记录日志。
-					log.Errorf("failed to commit Kafka message offset: %v", err)
-				}
+			log.Errorf("file task failed too many times, sent to dead letter topic and commit offset: md5=%s", task.FileMD5)
+			if err := updateFileTaskStatus(task, model.VectorizationStatusFailed, trimErrorMessage(processErr.Error(), 1000)); err != nil {
+				log.Errorf("failed to mark file upload as failed: md5=%s, userID=%d, error=%v", task.FileMD5, task.UserID, err)
+				continue
 			}
 
-			// 处理失败后结束当前消息流程；如果没提交 offset，后面会重试。
+			if err := r.CommitMessages(context.Background(), m); err != nil {
+				log.Errorf("failed to commit Kafka message offset: %v", err)
+			}
 			continue
 		}
 

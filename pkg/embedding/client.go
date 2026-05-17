@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"time"
 )
 
 // Client 定义 Embedding 客户端接口。
@@ -27,7 +28,7 @@ type openAICompatibleClient struct {
 func NewClient(cfg config.EmbeddingConfig) Client {
 	return &openAICompatibleClient{
 		cfg:    cfg,
-		client: &http.Client{},
+		client: &http.Client{Timeout: 60 * time.Second},
 	}
 }
 

@@ -8,6 +8,7 @@ import (
 	"mime"
 	"net/http"
 	"path/filepath"
+	"strings"
 )
 
 // Client 是 Apache Tika 服务的客户端。
@@ -55,12 +56,38 @@ func (c *Client) ExtractText(fileReader io.Reader, fileName string) (string, err
 	return buf.String(), nil
 }
 
+// knownMimeTypes 是常见文件扩展名到 MIME 类型的硬编码映射，
+// 用于补偿 Windows 系统注册表中可能缺失的 MIME 类型条目。
+var knownMimeTypes = map[string]string{
+	".pdf":  "application/pdf",
+	".doc":  "application/msword",
+	".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+	".xls":  "application/vnd.ms-excel",
+	".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+	".ppt":  "application/vnd.ms-powerpoint",
+	".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+	".txt":  "text/plain",
+	".md":   "text/plain",
+	".html": "text/html",
+	".htm":  "text/html",
+	".xml":  "application/xml",
+	".json": "application/json",
+	".csv":  "text/csv",
+	".rtf":  "application/rtf",
+	".odt":  "application/vnd.oasis.opendocument.text",
+}
+
 // detectMimeType 根据文件后缀推断 Content-Type。
 // Tika 依赖 Content-Type 来更准确地选择解析器。
+// 优先使用硬编码映射，再回退到系统 MIME 注册表，最后使用 octet-stream。
 func detectMimeType(fileName string) string {
-	ext := filepath.Ext(fileName)
+	ext := strings.ToLower(filepath.Ext(fileName))
 	if ext == "" {
 		return "application/octet-stream"
+	}
+
+	if mimeType, ok := knownMimeTypes[ext]; ok {
+		return mimeType
 	}
 
 	mimeType := mime.TypeByExtension(ext)

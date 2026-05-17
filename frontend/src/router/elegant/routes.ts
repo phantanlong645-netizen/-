@@ -107,7 +107,7 @@ export const generatedRoutes: GeneratedRoute[] = [
       i18nKey: 'route.org-tag',
       icon: 'solar:tag-line-duotone',
       roles: ['ADMIN'],
-      order: 4
+      order: 5
     }
   },
   {
@@ -118,7 +118,18 @@ export const generatedRoutes: GeneratedRoute[] = [
       title: 'personal-center',
       i18nKey: 'route.personal-center',
       icon: 'solar:people-nearby-line-duotone',
-      order: 6
+      order: 7
+    }
+  },
+  {
+    name: 'research-agent',
+    path: '/research-agent',
+    component: 'layout.base$view.research-agent',
+    meta: {
+      title: 'research-agent',
+      i18nKey: 'route.research-agent',
+      icon: 'solar:global-line-duotone',
+      order: 4
     }
   },
   {
@@ -130,7 +141,7 @@ export const generatedRoutes: GeneratedRoute[] = [
       i18nKey: 'route.user',
       icon: 'solar:user-line-duotone',
       roles: ['ADMIN'],
-      order: 5
+      order: 6
     }
   }
 ];
