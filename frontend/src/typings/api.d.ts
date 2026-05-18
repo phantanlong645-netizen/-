@@ -221,6 +221,17 @@ declare namespace Api {
         orgTag: string | null;
         isPublic: boolean;
       }
+
+      interface ProgressEvent {
+        type: 'think' | 'search' | 'found' | 'select' | 'finish' | 'done' | 'error' | 'result' | 'reflect' | 'reflect_keep' | 'reflect_reject';
+        source?: string;
+        query?: string;
+        count?: number;
+        title?: string;
+        reason?: string;
+        message?: string;
+        session_id?: number;
+      }
     }
   }
 
@@ -234,6 +245,18 @@ declare namespace Api {
       chunk: string;
     }
 
+    interface ThinkingStep {
+      step: string;
+      queries: string[];
+    }
+
+    interface Thinking {
+      intent?: string;
+      stepQueries?: ThinkingStep[];
+      steps?: string[];
+      queries?: string[];
+    }
+
     interface Conversation {
       conversationId: string;
     }
@@ -243,6 +266,7 @@ declare namespace Api {
       content: string;
       status?: 'pending' | 'loading' | 'finished' | 'error';
       timestamp?: string;
+      thinking?: Thinking;
     }
 
     interface Token {

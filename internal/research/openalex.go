@@ -35,6 +35,7 @@ func (t *OpenAlexTool) Search(ctx context.Context, query string, limit int) ([]P
 	values := endpoint.Query()
 	values.Set("search", query)
 	values.Set("per-page", fmt.Sprintf("%d", limit))
+	values.Set("filter", "is_oa:true")
 	values.Set("sort", "relevance_score:desc")
 	endpoint.RawQuery = values.Encode()
 
@@ -101,9 +102,6 @@ func (t *OpenAlexTool) Search(ctx context.Context, query string, limit int) ([]P
 		if item.PrimaryLocation != nil {
 			urlValue = item.PrimaryLocation.LandingPageURL
 			pdfURL = item.PrimaryLocation.PDFURL
-		}
-		if pdfURL == "" && item.OpenAccess != nil {
-			pdfURL = item.OpenAccess.OAURL
 		}
 		if urlValue == "" {
 			urlValue = item.ID

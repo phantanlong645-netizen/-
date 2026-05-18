@@ -21,6 +21,8 @@ type ResearchRepository interface {
 	GetCandidate(candidateID uint, userID uint) (*model.ResearchCandidate, error)
 	// UpdateCandidate 更新候选论文记录（如导入状态、文件MD5等）
 	UpdateCandidate(candidate *model.ResearchCandidate) error
+	// ListSessions 查询用户的历史检索会话列表，按创建时间降序
+	ListSessions(userID uint, limit int) ([]model.ResearchSession, error)
 }
 
 // researchRepository 数据访问层实现结构体
@@ -82,4 +84,19 @@ func (r *researchRepository) GetCandidate(candidateID uint, userID uint) (*model
 // UpdateCandidate 更新候选论文记录
 func (r *researchRepository) UpdateCandidate(candidate *model.ResearchCandidate) error {
 	return r.db.Save(candidate).Error
+}
+
+// ListSessions 查询用户的历史检索会话列表，按创建时间降序
+func (r *researchRepository) ListSessions(userID uint, limit int) ([]model.ResearchSession, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	var sessions []model.ResearchSession
+	err := r.db.
+		Where("user_id = ?", userID).
+		Order("created_at desc").
+		Limit(limit).
+		Find(&sessions).
+		Error
+	return sessions, err
 }

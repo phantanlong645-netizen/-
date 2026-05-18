@@ -20,6 +20,19 @@ watch(wsData, val => {
   const data = JSON.parse(val);
   const assistant = list.value[list.value.length - 1];
 
+  if (!assistant || assistant.role !== 'assistant') return;
+
+  if (data.type === 'thinking') {
+    assistant.thinking = {
+      intent: data.intent,
+      stepQueries: data.stepQueries,
+      steps: data.steps,
+      queries: data.queries
+    };
+    assistant.status = 'loading';
+    return;
+  }
+
   if (data.type === 'completion' && data.status === 'finished' && assistant.status !== 'error')
     assistant.status = 'finished';
   if (data.error) assistant.status = 'error';

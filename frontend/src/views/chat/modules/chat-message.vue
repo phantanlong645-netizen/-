@@ -19,6 +19,20 @@ const chatStore = useChatStore();
 // 存储文件名和对应的事件处理
 const sourceFiles = ref<Array<{fileName: string, id: string}>>([]);
 
+const thinkingSteps = computed(() => {
+  const thinking = props.msg.thinking;
+  if (!thinking) return [];
+
+  if (thinking.stepQueries?.length) {
+    return thinking.stepQueries.filter(item => item.step || item.queries?.length);
+  }
+
+  return (thinking.steps || []).map((step, index) => ({
+    step,
+    queries: index === 0 ? thinking.queries || [] : []
+  }));
+});
+
 // 处理来源文件链接的函数
 function processSourceLinks(text: string): string {
   // 匹配 (来源#数字: 文件名) 的正则表达式，同时兼容中文冒号 ：
@@ -143,6 +157,25 @@ async function handleSourceFileClick(fileName: string) {
     </NText>
     <NText v-else-if="msg.status === 'error'" class="ml-12 mt-2 italic">服务器繁忙，请稍后再试</NText>
     <div v-else-if="msg.role === 'assistant'" class="mt-2 pl-12" @click="handleContentClick">
+      <NCollapse v-if="msg.thinking" class="thinking-panel mb-3" arrow-placement="right">
+        <NCollapseItem title="思维过程" name="thinking">
+          <div class="thinking-intent" v-if="msg.thinking.intent">
+            <span class="thinking-label">意图</span>
+            <span>{{ msg.thinking.intent }}</span>
+          </div>
+          <div class="thinking-steps">
+            <div v-for="(item, index) in thinkingSteps" :key="index" class="thinking-step">
+              <div class="thinking-step-title">
+                <span class="thinking-index">{{ index + 1 }}</span>
+                <span>{{ item.step || '围绕问题检索相关知识' }}</span>
+              </div>
+              <div v-if="item.queries?.length" class="thinking-queries">
+                <span v-for="query in item.queries" :key="query" class="thinking-query">{{ query }}</span>
+              </div>
+            </div>
+          </div>
+        </NCollapseItem>
+      </NCollapse>
       <VueMarkdownIt :content="content" />
     </div>
     <NText v-else-if="msg.role === 'user'" class="ml-12 mt-2 text-4">{{ content }}</NText>
@@ -172,5 +205,75 @@ async function handleSourceFileClick(fileName: string) {
   &:active {
     color: #096dd9;
   }
+}
+
+.thinking-panel {
+  border: 1px solid rgba(99, 102, 241, 0.18);
+  border-radius: 8px;
+  background: rgba(99, 102, 241, 0.06);
+  padding: 2px 10px;
+}
+
+.thinking-intent {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  margin-bottom: 10px;
+  color: #374151;
+  line-height: 1.6;
+}
+
+.thinking-label {
+  flex: 0 0 auto;
+  border-radius: 4px;
+  background: rgba(99, 102, 241, 0.12);
+  color: #4f46e5;
+  padding: 0 6px;
+  font-size: 12px;
+}
+
+.thinking-steps {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.thinking-step-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #111827;
+  font-weight: 600;
+  line-height: 1.5;
+}
+
+.thinking-index {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 999px;
+  background: #4f46e5;
+  color: #fff;
+  font-size: 12px;
+}
+
+.thinking-queries {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-left: 28px;
+  margin-top: 6px;
+}
+
+.thinking-query {
+  border: 1px solid rgba(79, 70, 229, 0.22);
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.72);
+  color: #4338ca;
+  padding: 2px 8px;
+  font-size: 12px;
+  line-height: 1.6;
 }
 </style>

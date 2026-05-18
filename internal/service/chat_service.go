@@ -32,14 +32,138 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+// intentStep 表示一个解决步骤，以及该步骤需要召回的检索词。
+type intentStep struct {
+	// Step 是解决问题的一步。
+	Step string `json:"step"`
+	// Queries 是围绕这一步生成的多条检索词。
+	Queries []string `json:"queries"`
+}
+
 // intentResult 是意图分析阶段的结构化输出。
 type intentResult struct {
 	// Intent 是对用户问题意图的一句话概括。
 	Intent string `json:"intent"`
-	// Steps 是解决该问题的思维步骤列表。
-	Steps []string `json:"steps"`
-	// Queries 是每个步骤对应需要检索的知识点。
-	Queries []string `json:"queries"`
+	// Steps 是解决该问题的思维步骤，每一步都绑定自己的检索词。
+	Steps []intentStep `json:"steps"`
+	// Queries 兼容旧格式；新响应优先从 Steps 中展开检索词。
+	Queries []string `json:"queries,omitempty"`
+}
+
+func (r *intentResult) UnmarshalJSON(data []byte) error {
+	// raw 是临时解析结构，用来兼容新旧两种 steps JSON 格式。
+	var raw struct {
+		// Intent 接收 JSON 中的 intent 字段。
+		Intent string `json:"intent"`
+		// Steps 先保留为 RawMessage，后面逐项判断是对象格式还是旧字符串格式。
+		Steps []json.RawMessage `json:"steps"`
+		// Queries 接收旧格式里的顶层 queries 字段。
+		Queries []string `json:"queries"`
+	}
+	// 先把最外层 JSON 解析到 raw，失败说明模型返回的不是合法 JSON。
+	if err := json.Unmarshal(data, &raw); err != nil {
+		// 把 JSON 解析错误原样返回给上层。
+		return err
+	}
+
+	// 把解析出的用户意图写回真实结果结构。
+	r.Intent = raw.Intent
+	// 保留旧格式顶层 queries，后续 flatQueries 会统一去重展开。
+	r.Queries = raw.Queries
+	// 清空 Steps，避免复用结构体时混入旧数据。
+	r.Steps = nil
+
+	// 逐个解析 steps 里的元素，兼容对象格式和旧字符串格式。
+	for _, item := range raw.Steps {
+		// step 用来尝试解析新格式：{"step":"...","queries":[...]}。
+		var step intentStep
+		// 如果能解析成 intentStep，且 step 或 queries 至少有一个有效值，就加入结果。
+		if err := json.Unmarshal(item, &step); err == nil && (strings.TrimSpace(step.Step) != "" || len(step.Queries) > 0) {
+			// 保存新格式步骤。
+			r.Steps = append(r.Steps, step)
+			// 当前 item 已经处理完，继续下一个。
+			continue
+		}
+
+		// legacyStep 用来兼容旧格式：steps:["步骤1","步骤2"]。
+		var legacyStep string
+		// 如果当前 item 是非空字符串，就包装成只有 Step、没有 Queries 的步骤对象。
+		if err := json.Unmarshal(item, &legacyStep); err == nil && strings.TrimSpace(legacyStep) != "" {
+			// 保存旧格式步骤，检索词后续由顶层 queries 或兜底逻辑提供。
+			r.Steps = append(r.Steps, intentStep{Step: legacyStep})
+		}
+	}
+
+	// 兼容解析完成，返回 nil 表示 JSON 可用。
+	return nil
+}
+
+func (r *intentResult) stepTexts() []string {
+	// nil 接收者直接返回 nil，避免调用方空指针。
+	if r == nil {
+		// 没有结果时没有步骤文本。
+		return nil
+	}
+	// 预分配步骤文本切片，容量等于结构化步骤数量。
+	steps := make([]string, 0, len(r.Steps))
+	// 遍历每一个结构化步骤。
+	for _, step := range r.Steps {
+		// 只保留非空 step 文本，避免把空字符串发给前端。
+		if strings.TrimSpace(step.Step) != "" {
+			// 把步骤说明追加到兼容旧前端的 steps 字段。
+			steps = append(steps, step.Step)
+		}
+	}
+	// 返回纯文本步骤列表。
+	return steps
+}
+
+func (r *intentResult) flatQueries() []string {
+	// nil 接收者直接返回 nil，避免空指针。
+	if r == nil {
+		// 没有结果时没有检索词。
+		return nil
+	}
+
+	// queries 保存最终展开并去重后的检索词。
+	var queries []string
+	// seen 用于按完整字符串去重，避免重复检索同一个 query。
+	seen := make(map[string]struct{})
+	// add 是统一的检索词清洗、判空、去重和追加函数。
+	add := func(q string) {
+		// 去掉检索词首尾空白。
+		q = strings.TrimSpace(q)
+		// 空检索词没有检索价值，直接跳过。
+		if q == "" {
+			// 结束当前 add 调用。
+			return
+		}
+		// 如果已经添加过同样的检索词，就跳过。
+		if _, ok := seen[q]; ok {
+			// 结束当前 add 调用。
+			return
+		}
+		// 标记该检索词已经出现过。
+		seen[q] = struct{}{}
+		// 把新检索词追加到结果列表。
+		queries = append(queries, q)
+	}
+
+	// 优先展开新格式：每个 step 下绑定的 queries。
+	for _, step := range r.Steps {
+		// 遍历当前步骤下的每条检索词。
+		for _, q := range step.Queries {
+			// 清洗并加入当前检索词。
+			add(q)
+		}
+	}
+	// 再兼容旧格式：顶层 queries。
+	for _, q := range r.Queries {
+		// 清洗并加入旧格式检索词。
+		add(q)
+	}
+	// 返回所有可用于并行检索的 query。
+	return queries
 }
 
 // ChatService 定义聊天模块对外暴露的业务能力。
@@ -63,15 +187,23 @@ type chatService struct {
 // NewChatService 创建聊天业务对象，并注入它依赖的搜索服务、LLM 客户端和会话仓储。
 // 若配置中 lightrag.enable=true，会自动初始化 LightRAG 客户端。
 func NewChatService(searchService SearchService, llmClient llm.Client, conversationRepo repository.ConversationRepository) ChatService {
+	// svc 保存聊天服务实例和它依赖的搜索、模型、会话仓储。
 	svc := &chatService{
-		searchService:    searchService,
-		llmClient:        llmClient,
+		// 注入知识库搜索服务。
+		searchService: searchService,
+		// 注入主 LLM 客户端。
+		llmClient: llmClient,
+		// 注入 Redis 会话仓储。
 		conversationRepo: conversationRepo,
 	}
+	// 如果配置开启 LightRAG，就初始化图谱检索客户端。
 	if config.Conf.LightRAG.Enable {
+		// 创建 LightRAG REST 客户端，供聊天时补充图谱上下文。
 		svc.lightragClient = lightrag.NewClient(config.Conf.LightRAG)
+		// 记录 LightRAG 已启用，方便启动日志确认配置生效。
 		log.Infof("[ChatService] LightRAG 已启用, URL: %s", config.Conf.LightRAG.URL)
 	}
+	// 返回接口类型，隐藏具体实现结构体。
 	return svc
 }
 
@@ -79,17 +211,26 @@ func NewChatService(searchService SearchService, llmClient llm.Client, conversat
 func (s *chatService) StreamResponse(ctx context.Context, query string, user *model.User, ws *websocket.Conn, shouldStop func() bool) error {
 	// 第一步：意图分析——用轻量模型把用户问题拆解成思维步骤和多个子检索词。
 	intent, err := s.analyzeIntent(ctx, query)
+	// 如果意图分析失败，不能影响主问答链路，需要降级继续回答。
 	if err != nil {
 		// 意图分析失败时降级为原始问题直接检索，不中断整个流程。
 		log.Warnf("[ChatService] 意图分析失败，降级为单次检索: %v", err)
-		intent = &intentResult{Queries: []string{query}}
+		// 构造一个只包含原始问题的兜底意图。
+		intent = fallbackIntent(query)
 	}
 
 	// 把意图分析结果（思维链）推送给前端，让用户看到"正在思考"的过程。
 	sendThinkingEvent(ws, intent)
 
 	// 第二步：并行检索——对每个子查询同时发起知识库召回，汇总去重后作为上下文。
-	results := s.parallelSearch(ctx, intent.Queries, 5, user)
+	searchQueries := intent.flatQueries()
+	// 如果结构化步骤和兼容字段都没提供检索词，就回退到用户原问题。
+	if len(searchQueries) == 0 {
+		// 使用原始问题作为唯一检索词。
+		searchQueries = []string{query}
+	}
+	// 对所有检索词并发执行混合搜索，每个 query 最多召回 5 条。
+	results := s.parallelSearch(ctx, searchQueries, 5, user)
 
 	// 把搜索结果转换成一段可放进 prompt 的参考资料文本。
 	contextText := s.buildContextText(results)
@@ -97,11 +238,16 @@ func (s *chatService) StreamResponse(ctx context.Context, query string, user *mo
 	// 第三步（可选）：若 LightRAG 已启用，补充图谱检索上下文。
 	// LightRAG 的 mix 模式同时用向量检索和知识图谱推理，可以找到 ES 遗漏的实体关系。
 	if s.lightragClient != nil {
+		// 使用用户原始问题查询 LightRAG，mode=mix 表示图谱和向量混合检索。
 		graphCtx, err := s.lightragClient.QueryContext(ctx, query, "mix")
+		// LightRAG 失败只降级，不中断 ES 检索和主模型回答。
 		if err != nil {
+			// 记录图谱检索失败原因。
 			log.Warnf("[ChatService] LightRAG 检索失败，忽略图谱上下文: %v", err)
 		} else if strings.TrimSpace(graphCtx) != "" {
+			// 把图谱上下文放到普通检索上下文之后，作为补充信息。
 			contextText = contextText + "\n\n--- 知识图谱补充信息 ---\n" + graphCtx
+			// 记录补充上下文长度，便于观察 LightRAG 是否生效。
 			log.Infof("[ChatService] LightRAG 返回图谱上下文，长度: %d 字符", len(graphCtx))
 		}
 	}
@@ -113,7 +259,9 @@ func (s *chatService) StreamResponse(ctx context.Context, query string, user *mo
 	history, err := s.loadHistory(ctx, user.ID)
 	// 历史读取失败不阻断本次问答，只记录日志，然后按无历史继续。
 	if err != nil {
+		// 记录历史读取失败。
 		log.Errorf("Failed to load conversation history: %v", err)
+		// 使用空历史继续构造本轮消息。
 		history = []model.ChatMessage{}
 	}
 
@@ -151,6 +299,7 @@ func (s *chatService) StreamResponse(ctx context.Context, query string, user *mo
 	err = s.llmClient.StreamChatMessages(ctx, llmMsgs, gen, interceptor)
 	// 如果大模型调用失败，直接返回错误给上层 handler。
 	if err != nil {
+		// 返回 LLM 调用错误，由 handler 包装成前端错误消息。
 		return err
 	}
 
@@ -165,6 +314,7 @@ func (s *chatService) StreamResponse(ctx context.Context, query string, user *mo
 		err = s.addMessageToConversation(context.Background(), user.ID, query, fullAnswer)
 		// 保存历史失败不影响本次回答，因为答案已经成功流式返回给前端。
 		if err != nil {
+			// 记录保存失败，但不把失败返回给用户。
 			log.Errorf("Failed to save conversation history: %v", err)
 		}
 	}
@@ -179,66 +329,108 @@ func (s *chatService) analyzeIntent(ctx context.Context, query string) (*intentR
 	systemPrompt := `你是一个查询分析助手。给定用户问题，请分析：
 1. 用户意图（一句话概括）
 2. 解决这个问题的思维步骤（2-4个步骤）
-3. 每个步骤需要检索的知识点（简洁的检索词）
+3. 每个步骤需要检索的知识点（每步 2-4 条简洁检索词）
 
 必须严格以 JSON 格式返回，不要有任何额外文字、代码块标记或注释：
-{"intent":"用户意图","steps":["步骤1","步骤2"],"queries":["检索词1","检索词2"]}`
+{"intent":"用户意图","steps":[{"step":"步骤1","queries":["检索词1","检索词2"]},{"step":"步骤2","queries":["检索词3","检索词4"]}]}`
 
 	// 构造发给意图分析模型的消息列表。
 	messages := []llm.Message{
+		// system message 规定模型必须按指定 JSON schema 输出。
 		{Role: "system", Content: systemPrompt},
+		// user message 放入用户本轮原始问题。
 		{Role: "user", Content: query},
 	}
 
 	// 确定意图分析使用的模型：优先用配置里的 intent_model，没有就退回主模型。
 	intentModel := config.Conf.LLM.IntentModel
+	// 如果没有单独配置 intent_model，就使用主问答模型。
 	if intentModel == "" {
+		// 回退到主模型配置。
 		intentModel = config.Conf.LLM.Model
 	}
 
 	// 构造专用于意图分析的轻量 LLM 配置：低 temperature 保证 JSON 格式稳定。
 	intentCfg := config.LLMConfig{
-		APIKey:  config.Conf.LLM.APIKey,
+		// 复用主 LLM 的 API key。
+		APIKey: config.Conf.LLM.APIKey,
+		// 复用主 LLM 的 OpenAI 兼容 base URL。
 		BaseURL: config.Conf.LLM.BaseURL,
-		Model:   intentModel,
+		// 使用轻量意图模型或兜底主模型。
+		Model: intentModel,
 	}
+	// 根据意图分析专用配置创建一个临时 LLM 客户端。
 	intentClient := llm.NewClient(intentCfg)
 
 	// 调用非流式接口，一次性拿到完整 JSON 响应。
 	temp := 0.1
+	// maxTok 限制意图分析输出长度，防止模型生成过长解释。
 	maxTok := 512
+	// 调用非流式 chat completion，要求返回完整 JSON 字符串。
 	raw, err := intentClient.CompleteChatMessages(ctx, messages, &llm.GenerationParams{
+		// 低温度提高格式稳定性。
 		Temperature: &temp,
-		MaxTokens:   &maxTok,
+		// 限制最大输出 token。
+		MaxTokens: &maxTok,
 	})
+	// 如果意图分析模型调用失败，返回错误给 StreamResponse 做降级。
 	if err != nil {
+		// 包装错误，保留调用失败原因。
 		return nil, fmt.Errorf("intent analysis LLM call failed: %w", err)
 	}
 
+	// 打印模型原始输出，方便排查 JSON 格式问题。
 	log.Infof("[ChatService] 意图分析原始响应: %s", raw)
 
 	// 有时模型会在 JSON 前后附加 markdown 代码块标记，尝试提取其中的 JSON 部分。
 	raw = strings.TrimSpace(raw)
+	// 如果第一个左花括号不在开头，就裁掉前面的 markdown 或解释文本。
 	if idx := strings.Index(raw, "{"); idx > 0 {
+		// 从第一个 JSON 对象起始位置开始保留。
 		raw = raw[idx:]
 	}
+	// 如果最后一个右花括号后还有内容，就裁掉尾部多余文本。
 	if idx := strings.LastIndex(raw, "}"); idx >= 0 && idx < len(raw)-1 {
+		// 保留到最后一个 JSON 对象结束位置。
 		raw = raw[:idx+1]
 	}
 
 	// 把 JSON 字符串反序列化成 intentResult。
 	var result intentResult
+	// json.Unmarshal 会调用 intentResult.UnmarshalJSON，兼容新旧 steps 格式。
 	if err := json.Unmarshal([]byte(raw), &result); err != nil {
+		// 如果仍然无法解析，返回错误让上层降级为原始问题检索。
 		return nil, fmt.Errorf("failed to parse intent JSON: %w", err)
 	}
 
-	// 如果模型没有返回任何 queries，就用原始问题兜底。
-	if len(result.Queries) == 0 {
-		result.Queries = []string{query}
+	// 如果模型没有返回任何可用 queries，就用原始问题兜底。
+	if len(result.flatQueries()) == 0 {
+		// 用原始问题构造一个默认检索步骤。
+		result = *fallbackIntent(query)
 	}
 
-	log.Infof("[ChatService] 意图分析结果: intent=%s, steps=%d, queries=%v", result.Intent, len(result.Steps), result.Queries)
+	// 记录结构化意图分析结果，方便观察模型拆解质量。
+	log.Infof("[ChatService] 意图分析结果: intent=%s, steps=%d, queries=%v", result.Intent, len(result.Steps), result.flatQueries())
+	// 返回结构化意图分析结果。
 	return &result, nil
+}
+
+func fallbackIntent(query string) *intentResult {
+	// 返回一个最小可用意图：用原始问题作为唯一检索词。
+	return &intentResult{
+		// 默认意图说明。
+		Intent: "回答用户问题",
+		// Steps 至少包含一个步骤，保持 thinking 事件结构稳定。
+		Steps: []intentStep{
+			// 兜底步骤表示没有成功拆解，只按原问题检索。
+			{
+				// Step 是前端可展示的兜底步骤说明。
+				Step: "围绕用户原始问题检索相关知识",
+				// Queries 用原始问题检索，保证 RAG 链路仍能运行。
+				Queries: []string{query},
+			},
+		},
+	}
 }
 
 // parallelSearch 并发对每个子查询执行知识库召回，合并去重后返回结果。
@@ -246,16 +438,26 @@ func (s *chatService) parallelSearch(ctx context.Context, queries []string, topK
 	// resultCh 收集所有 goroutine 的检索结果。
 	resultCh := make(chan []model.SearchResponseDTO, len(queries))
 
+	// wg 用来等待所有并发检索 goroutine 结束。
 	var wg sync.WaitGroup
+	// 遍历每一个查询词，为每个查询词启动一个检索任务。
 	for _, q := range queries {
+		// 每启动一个 goroutine，WaitGroup 计数加一。
 		wg.Add(1)
+		// 启动 goroutine 并发执行当前子查询。
 		go func(q string) {
+			// 当前 goroutine 结束时通知 WaitGroup。
 			defer wg.Done()
+			// 调用混合检索服务，从知识库召回当前查询词的 topKEach 条结果。
 			res, err := s.searchService.HybridSearch(ctx, q, topKEach, user)
+			// 如果当前子查询失败，只记录日志，不影响其他子查询结果。
 			if err != nil {
+				// 记录失败的子查询和错误原因。
 				log.Warnf("[ChatService] 子查询检索失败 query='%s': %v", q, err)
+				// 结束当前 goroutine。
 				return
 			}
+			// 把当前子查询的检索结果发送到结果通道。
 			resultCh <- res
 		}(q)
 	}
@@ -266,33 +468,51 @@ func (s *chatService) parallelSearch(ctx context.Context, queries []string, topK
 
 	// 收集结果并按 TextContent 前缀去重，避免多个子查询命中同一片段。
 	var merged []model.SearchResponseDTO
+	// seen 记录已经加入 merged 的文本前缀。
 	seen := make(map[string]bool)
+	// 遍历所有 goroutine 返回的结果切片。
 	for res := range resultCh {
+		// 遍历当前子查询命中的每条结果。
 		for _, r := range res {
 			// 用文本内容的前 80 字符作为去重 key，平衡精度和性能。
 			key := r.TextContent
+			// 如果文本很长，只取前 80 个字节作为近似去重 key。
 			if len(key) > 80 {
+				// 截断 key，避免大文本作为 map key 带来额外开销。
 				key = key[:80]
 			}
+			// 如果这个文本前缀还没出现过，就加入合并结果。
 			if !seen[key] {
+				// 标记该文本前缀已经出现。
 				seen[key] = true
+				// 把当前命中结果加入最终合并列表。
 				merged = append(merged, r)
 			}
 		}
 	}
 
+	// 记录并行检索输入 query 数和去重后的结果数。
 	log.Infof("[ChatService] 并行检索完成: queries=%d, merged=%d 条", len(queries), len(merged))
+	// 返回去重后的检索结果。
 	return merged
 }
 
 // sendThinkingEvent 把意图分析结果作为 thinking 事件推送给前端。
 func sendThinkingEvent(ws *websocket.Conn, intent *intentResult) {
+	// payload 是推送给前端的思考过程事件。
 	payload := map[string]interface{}{
-		"type":    "thinking",
-		"intent":  intent.Intent,
-		"steps":   intent.Steps,
-		"queries": intent.Queries,
+		// type=thinking 表示这是思考过程事件，不是普通回答 chunk。
+		"type": "thinking",
+		// intent 是模型识别出的用户核心意图。
+		"intent": intent.Intent,
+		// stepQueries 是新结构：每个步骤绑定自己的 queries。
+		"stepQueries": intent.Steps,
+		// steps 是兼容字段：只包含步骤文本。
+		"steps": intent.stepTexts(),
+		// queries 是兼容字段：把所有步骤里的检索词展平。
+		"queries": intent.flatQueries(),
 	}
+	// 将 thinking 事件序列化成 JSON。
 	b, _ := json.Marshal(payload)
 	// 推送失败不影响后续流程，忽略错误。
 	_ = ws.WriteMessage(websocket.TextMessage, b)

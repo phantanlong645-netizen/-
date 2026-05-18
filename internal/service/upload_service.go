@@ -2,7 +2,10 @@
 package service
 
 import (
+	"bytes"
 	"context"
+	"crypto/md5"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"math"
@@ -47,6 +50,9 @@ type UploadService interface {
 	GetSupportedFileTypes() (map[string]interface{}, error)
 	// FastUpload 单独做一次秒传检查。
 	FastUpload(ctx context.Context, fileMD5 string, userID uint) (bool, error)
+	// ImportFile 将已下载的文件内容直接导入知识库，跳过分片上传流程。
+	// 供研究检索Agent将论文内容一步导入用户的知识库。
+	ImportFile(ctx context.Context, content []byte, fileName, contentType, orgTag string, isPublic bool, userID uint) (*model.FileUpload, error)
 }
 
 // uploadService 是 UploadService 的具体实现。
@@ -691,4 +697,90 @@ func getFileType(fileName string) string {
 	}
 	// 如果是不认识的扩展名，就返回类似 CSV文件、JSON文件。
 	return strings.ToUpper(ext[1:]) + "文件"
+}
+
+// ImportFile 将已下载的文件内容直接导入知识库，跳过分片上传流程。
+// 供研究检索 Agent 使用：下载好论文内容后，一步写入 MinIO、创建上传记录并发送 Kafka 消息。
+func (s *uploadService) ImportFile(ctx context.Context, content []byte, fileName, contentType, orgTag string, isPublic bool, userID uint) (*model.FileUpload, error) {
+	// 计算文件 MD5，用于去重和唯一标识
+	sum := md5.Sum(content)
+	fileMD5 := hex.EncodeToString(sum[:])
+
+	// 生成 MinIO 对象路径：userID/MD5/文件名
+	objectName := storagepath.MergedObjectName(userID, fileMD5, fileName)
+
+	// 上传文件到 MinIO
+	if _, err := storage.MinioClient.PutObject(ctx, s.minioCfg.BucketName, objectName,
+		bytes.NewReader(content), int64(len(content)),
+		minio.PutObjectOptions{ContentType: contentType},
+	); err != nil {
+		return nil, err
+	}
+
+	// 查询是否已存在相同的上传记录（基于 MD5 + 用户 ID）
+	record, err := s.uploadRepo.GetFileUploadRecord(fileMD5, userID)
+	if err != nil {
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
+			s.removeObject(objectName)
+			return nil, err
+		}
+		// 记录不存在，创建新记录
+		record = &model.FileUpload{
+			FileMD5:                   fileMD5,
+			FileName:                  fileName,
+			TotalSize:                 int64(len(content)),
+			Status:                    model.FileUploadStatusCompleted,
+			VectorizationStatus:       model.VectorizationStatusPending,
+			VectorizationErrorMessage: "",
+			UserID:                    userID,
+			OrgTag:                    orgTag,
+			IsPublic:                  isPublic,
+		}
+		if err := s.uploadRepo.CreateFileUploadRecord(record); err != nil {
+			s.removeObject(objectName)
+			return nil, err
+		}
+	} else {
+		// 记录已存在，覆盖更新（文件名、权限等可能变化）
+		record.FileName = fileName
+		record.TotalSize = int64(len(content))
+		record.Status = model.FileUploadStatusCompleted
+		record.VectorizationStatus = model.VectorizationStatusPending
+		record.VectorizationErrorMessage = ""
+		record.OrgTag = orgTag
+		record.IsPublic = isPublic
+		if err := s.uploadRepo.UpdateFileUploadRecord(record); err != nil {
+			s.removeObject(objectName)
+			return nil, err
+		}
+	}
+
+	// 重置 Kafka 处理尝试次数，确保文件被重新处理
+	if err := kafka.ResetFileTaskAttempts(fileMD5); err != nil {
+		_ = s.uploadRepo.UpdateFileVectorizationStatus(record.ID, model.VectorizationStatusFailed,
+			"reset file task attempts failed: "+err.Error())
+		return nil, err
+	}
+
+	// 发送文件处理任务到 Kafka 队列，触发向量化和文件处理流程
+	task := tasks.FileProcessingTask{
+		FileMD5:  fileMD5,
+		FileName: fileName,
+		UserID:   userID,
+		OrgTag:   orgTag,
+		IsPublic: isPublic,
+	}
+	if err := kafka.ProduceFileTask(task); err != nil {
+		_ = s.uploadRepo.UpdateFileVectorizationStatus(record.ID, model.VectorizationStatusFailed,
+			"send file processing task to Kafka failed: "+err.Error())
+		return nil, err
+	}
+
+	record.VectorizationStatus = model.VectorizationStatusPending
+	return record, nil
+}
+
+// removeObject 删除 MinIO 中已上传的对象，用于导入失败时的清理。
+func (s *uploadService) removeObject(objectName string) {
+	_ = storage.MinioClient.RemoveObject(context.Background(), s.minioCfg.BucketName, objectName, minio.RemoveObjectOptions{})
 }

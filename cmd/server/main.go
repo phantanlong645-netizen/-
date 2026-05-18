@@ -76,7 +76,7 @@ func main() {
 	searchService := service.NewSearchService(embeddingClient, es.ESClient, userService, uploadRepo)
 	conversationService := service.NewConversationService(conversationRepo)
 	chatService := service.NewChatService(searchService, llmClient, conversationRepo)
-	researchAgentService := service.NewResearchAgentService(researchRepo, uploadRepo, orgTagRepo, cfg.MinIO, cfg.ResearchAgent, llmClient)
+	researchAgentService := service.NewResearchAgentService(researchRepo, orgTagRepo, cfg.ResearchAgent, llmClient, uploadService)
 	processor := pipeline.NewProcessor(
 		tikaClient,
 		embeddingClient,
@@ -199,7 +199,9 @@ func registerRoutes(
 		researchAgent.Use(middleware.AuthMiddleware(jwtManager, userService))
 		{
 			researchAgentHandler := handler.NewResearchAgentHandler(researchAgentService, userService)
+			researchAgent.GET("/sessions", researchAgentHandler.ListSessions)
 			researchAgent.POST("/sessions", researchAgentHandler.RunSearch)
+			researchAgent.POST("/sessions/stream", researchAgentHandler.RunSearchStream)
 			researchAgent.GET("/sessions/:sessionId/candidates", researchAgentHandler.ListCandidates)
 			researchAgent.POST("/candidates/:candidateId/import", researchAgentHandler.ImportCandidate)
 		}

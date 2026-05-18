@@ -137,6 +137,7 @@ type EmbeddingConfig struct {
 type ResearchAgentConfig struct {
 	SemanticScholarAPIKey string `mapstructure:"semantic_scholar_api_key"`
 	MaxCandidates         int    `mapstructure:"max_candidates"`
+	MaxIterations         int    `mapstructure:"max_iterations"`
 }
 
 func Init(configPath string) {

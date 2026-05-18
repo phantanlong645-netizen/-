@@ -1,6 +1,8 @@
 package handler
 
 import (
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"strconv"
 
@@ -144,4 +146,124 @@ func (h *ResearchAgentHandler) getUserFromContext(c *gin.Context) (*model.User, 
 
 	// 根据用户名获取完整的用户信息
 	return h.userService.GetProfile(claims.Username)
+}
+
+// ListSessions 返回当前用户的历史检索会话列表
+func (h *ResearchAgentHandler) ListSessions(c *gin.Context) {
+	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "20"))
+
+	user, err := h.getUserFromContext(c)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "无法获取用户信息"})
+		return
+	}
+
+	sessions, err := h.researchAgentService.ListSessions(user, limit)
+	if err != nil {
+		log.Warnf("ListResearchSessions: failed for user %s, err: %v", user.Username, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"code":    http.StatusOK,
+		"message": "success",
+		"data":    sessions,
+	})
+}
+
+// RunSearchStream 以 SSE（Server-Sent Events）方式执行检索，实时推送 Agent 进度。
+// 客户端监听事件流：每个 data 行是一个 JSON AgentProgressEvent。
+// 当 type="done" 时 data.count 即最终候选数，完整候选列表请再调用 GET /sessions/:id/candidates。
+func (h *ResearchAgentHandler) RunSearchStream(c *gin.Context) {
+	var req service.ResearchSearchRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的请求参数"})
+		return
+	}
+
+	user, err := h.getUserFromContext(c)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "无法获取用户信息"})
+		return
+	}
+
+	// 设置 SSE 响应头
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+	c.Header("X-Accel-Buffering", "no") // 禁用 Nginx 缓冲，确保事件立即推送
+
+	flusher, ok := c.Writer.(http.Flusher)
+	if !ok {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "不支持流式响应"})
+		return
+	}
+
+	// 用带缓冲的 channel 接收事件，避免阻塞 Agent goroutine
+	eventCh := make(chan service.AgentProgressEvent, 32)
+	doneCh := make(chan struct{})
+
+	// 在独立 goroutine 中运行 Agent，完成后关闭 eventCh
+	var (
+		result   *service.ResearchSearchResponse
+		agentErr error
+	)
+	go func() {
+		defer close(doneCh)
+		result, agentErr = h.researchAgentService.RunSearchStream(
+			c.Request.Context(), user, req,
+			func(e service.AgentProgressEvent) {
+				select {
+				case eventCh <- e:
+				default: // 缓冲满时丢弃，不阻塞 Agent
+				}
+			},
+		)
+	}()
+
+	writeEvent := func(e service.AgentProgressEvent) {
+		data, _ := json.Marshal(e)
+		fmt.Fprintf(c.Writer, "data: %s\n\n", data)
+		flusher.Flush()
+	}
+
+	// 持续读取事件，直到 Agent 完成或客户端断开
+	for {
+		select {
+		case e := <-eventCh:
+			writeEvent(e)
+		case <-doneCh:
+			// 清空缓冲区中剩余事件
+			for {
+				select {
+				case e := <-eventCh:
+					writeEvent(e)
+				default:
+					goto streamDone
+				}
+			}
+		case <-c.Request.Context().Done():
+			return
+		}
+	}
+
+streamDone:
+	if agentErr != nil {
+		data, _ := json.Marshal(service.AgentProgressEvent{Type: "error", Message: agentErr.Error()})
+		fmt.Fprintf(c.Writer, "data: %s\n\n", data)
+		flusher.Flush()
+		return
+	}
+
+	// 把最终 session ID 写入 done 事件，方便前端随后拉取候选列表
+	if result != nil {
+		data, _ := json.Marshal(map[string]interface{}{
+			"type":       "result",
+			"session_id": result.Session.ID,
+			"count":      len(result.Candidates),
+		})
+		fmt.Fprintf(c.Writer, "data: %s\n\n", data)
+		flusher.Flush()
+	}
 }

@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import { getAuthorization } from '@/service/request/shared';
+
 defineOptions({
   name: 'ResearchAgent'
 });
@@ -8,14 +10,24 @@ const candidates = ref<Api.KnowledgeBase.ResearchAgent.Candidate[]>([]);
 const importedFile = ref<Api.KnowledgeBase.UploadTask | null>(null);
 const importingIds = ref<Set<number>>(new Set());
 const importPublic = ref(false);
+const progressLog = ref<Api.KnowledgeBase.ResearchAgent.ProgressEvent[]>([]);
+const progressScrollEl = ref<HTMLElement | null>(null);
+const sessions = ref<Api.KnowledgeBase.ResearchAgent.Session[]>([]);
+const sessionLoading = ref(false);
+const abortCtrl = ref<AbortController | null>(null);
 
 const searchModel = ref<Api.KnowledgeBase.ResearchAgent.SearchRequest>({
   query: '',
   limit: 10
 });
 
-const researchSearchTimeout = 120 * 1000;
 const researchImportTimeout = 120 * 1000;
+
+// SSE base URL follows the same proxy logic as the axios request instance
+const isHttpProxy = import.meta.env.DEV && import.meta.env.VITE_HTTP_PROXY === 'Y';
+const sseBaseURL = isHttpProxy ? '/proxy-default' : (import.meta.env.VITE_SERVICE_BASE_URL ?? '');
+
+const selectedCount = computed(() => progressLog.value.filter(e => e.type === 'select').length);
 
 function reset() {
   searchModel.value = {
@@ -23,8 +35,16 @@ function reset() {
     limit: 10
   };
   candidates.value = [];
+  progressLog.value = [];
   importedFile.value = null;
   importingIds.value = new Set();
+}
+
+function cancelSearch() {
+  abortCtrl.value?.abort();
+  abortCtrl.value = null;
+  loading.value = false;
+  window.$message?.info('已取消检索');
 }
 
 function setImporting(candidateId: number, importing: boolean) {
@@ -57,6 +77,61 @@ function openURL(url?: string) {
   window.open(url, '_blank', 'noopener,noreferrer');
 }
 
+function formatTime(t: string) {
+  return dayjs(t).format('MM-DD HH:mm');
+}
+
+function eventLabel(e: Api.KnowledgeBase.ResearchAgent.ProgressEvent): string {
+  switch (e.type) {
+    case 'reflect':
+      return e.message ?? 'Critic 审核中…';
+    case 'reflect_keep':
+      return `✓ 保留：${e.title ?? ''}`;
+    case 'reflect_reject':
+      return `✕ 拒绝：${e.title ?? ''}（${e.reason ?? ''}）`;
+    case 'think':
+      return e.message ?? '';
+    case 'search':
+      return `搜索 ${e.source ?? ''}: ${e.query ?? ''}`;
+    case 'found':
+      return `在 ${e.source ?? ''} 找到 ${e.count ?? 0} 篇`;
+    case 'select':
+      return `已选：${e.title ?? ''}`;
+    case 'finish':
+      return e.message ?? '检索完成';
+    case 'done':
+      return e.message ?? '完成';
+    case 'error':
+      return `错误：${e.message ?? ''}`;
+    default:
+      return e.message ?? '';
+  }
+}
+
+async function loadSessions() {
+  sessionLoading.value = true;
+  const { error, data } = await request<Api.KnowledgeBase.ResearchAgent.Session[]>({
+    url: '/research-agent/sessions?limit=10',
+    method: 'GET'
+  });
+  sessionLoading.value = false;
+  if (!error) sessions.value = data;
+}
+
+async function loadSession(sessionId: number, query: string) {
+  searchModel.value.query = query;
+  candidates.value = [];
+  progressLog.value = [];
+  const { error, data } = await request<Api.KnowledgeBase.ResearchAgent.Candidate[]>({
+    url: `/research-agent/sessions/${sessionId}/candidates`,
+    method: 'GET'
+  });
+  if (!error) {
+    candidates.value = data;
+    if (data.length === 0) window.$message?.info('该会话暂无候选结果');
+  }
+}
+
 async function search() {
   const query = searchModel.value.query.trim();
   if (!query) {
@@ -66,23 +141,85 @@ async function search() {
 
   loading.value = true;
   candidates.value = [];
+  progressLog.value = [];
   importedFile.value = null;
 
-  const { error, data } = await request<Api.KnowledgeBase.ResearchAgent.SearchResponse>({
-    url: '/research-agent/sessions',
-    method: 'POST',
-    timeout: researchSearchTimeout,
-    data: {
-      query,
-      limit: searchModel.value.limit
-    }
-  });
+  const ctrl = new AbortController();
+  abortCtrl.value = ctrl;
 
-  if (!error) {
-    candidates.value = data.candidates;
-    if (data.candidates.length === 0) window.$message?.info('没有检索到候选结果');
+  const auth = getAuthorization();
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (auth) headers['Authorization'] = auth;
+
+  try {
+    const response = await fetch(`${sseBaseURL}/research-agent/sessions/stream`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ query, limit: searchModel.value.limit }),
+      signal: ctrl.signal
+    });
+
+    if (!response.ok || !response.body) {
+      window.$message?.error(`检索请求失败 (${response.status})`);
+      loading.value = false;
+      abortCtrl.value = null;
+      return;
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let sessionId: number | null = null;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() ?? '';
+
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        const raw = line.slice(6).trim();
+        if (!raw) continue;
+        try {
+          const evt = JSON.parse(raw) as Api.KnowledgeBase.ResearchAgent.ProgressEvent;
+          if (evt.type === 'result') {
+            sessionId = evt.session_id ?? null;
+          } else {
+            progressLog.value.push(evt);
+            nextTick(() => {
+              if (progressScrollEl.value) {
+                progressScrollEl.value.scrollTop = progressScrollEl.value.scrollHeight;
+              }
+            });
+          }
+        } catch {
+          // ignore malformed SSE frames
+        }
+      }
+    }
+
+    // Fetch candidates after stream ends
+    if (sessionId) {
+      const { error, data } = await request<Api.KnowledgeBase.ResearchAgent.Candidate[]>({
+        url: `/research-agent/sessions/${sessionId}/candidates`,
+        method: 'GET'
+      });
+      if (!error) {
+        candidates.value = data;
+        if (data.length === 0) window.$message?.info('没有检索到候选结果');
+      }
+    }
+
+    loadSessions();
+  } catch (e: unknown) {
+    if (e instanceof Error && e.name !== 'AbortError') {
+      window.$message?.error('检索连接失败，请重试');
+    }
   }
 
+  abortCtrl.value = null;
   loading.value = false;
 }
 
@@ -111,6 +248,8 @@ async function importCandidate(candidate: Api.KnowledgeBase.ResearchAgent.Candid
   importedFile.value = data;
   window.$message?.success('已导入知识库，后台正在处理');
 }
+
+onMounted(() => loadSessions());
 </script>
 
 <template>
@@ -135,13 +274,19 @@ async function importCandidate(candidate: Api.KnowledgeBase.ResearchAgent.Candid
                 <NSwitch v-model:value="importPublic" size="small" />
                 <NText class="text-13px">{{ importPublic ? '公开导入' : '私有导入' }}</NText>
               </NSpace>
-              <NButton @click="reset">
+              <NButton :loading="loading" @click="reset">
                 <template #icon>
                   <icon-ic-round-refresh class="text-icon" />
                 </template>
                 重置
               </NButton>
-              <NButton type="primary" ghost :loading="loading" @click="search">
+              <NButton v-if="loading" type="error" ghost @click="cancelSearch">
+                <template #icon>
+                  <icon-ic-round-stop class="text-icon" />
+                </template>
+                取消
+              </NButton>
+              <NButton v-else type="primary" ghost :loading="loading" @click="search">
                 <template #icon>
                   <icon-ic-round-search class="text-icon" />
                 </template>
@@ -157,7 +302,93 @@ async function importCandidate(candidate: Api.KnowledgeBase.ResearchAgent.Candid
       </NForm>
     </NCard>
 
+    <!-- Agent 实时进度日志 -->
+    <NCard
+      v-if="progressLog.length > 0 || loading"
+      :bordered="false"
+      size="small"
+      class="card-wrapper"
+    >
+      <template #header>
+        <NSpace align="center" :size="8">
+          <span>Agent 进度</span>
+          <NTag v-if="selectedCount > 0" size="small" type="success" :bordered="false">
+            已选 {{ selectedCount }} / {{ searchModel.limit }}
+          </NTag>
+        </NSpace>
+      </template>
+      <div
+        ref="progressScrollEl"
+        class="max-h-220px overflow-y-auto space-y-4px pr-4px font-mono text-12px"
+      >
+        <div
+          v-for="(evt, idx) in progressLog"
+          :key="idx"
+          class="flex items-start gap-8px leading-5"
+          :class="{
+            'text-gray-400 italic': evt.type === 'think',
+            'text-blue-500': evt.type === 'search',
+            'text-green-500': evt.type === 'found' || evt.type === 'select' || evt.type === 'reflect_keep',
+            'text-orange-500 font-semibold': evt.type === 'finish' || evt.type === 'done' || evt.type === 'reflect',
+            'text-red-500': evt.type === 'error' || evt.type === 'reflect_reject'
+          }"
+        >
+          <span class="mt-1px shrink-0 text-10px opacity-60">
+            <template v-if="evt.type === 'think'">💭</template>
+            <template v-else-if="evt.type === 'search'">🔍</template>
+            <template v-else-if="evt.type === 'found'">📄</template>
+            <template v-else-if="evt.type === 'select'">✅</template>
+            <template v-else-if="evt.type === 'finish' || evt.type === 'done'">🏁</template>
+            <template v-else-if="evt.type === 'error'">⚠️</template>
+            <template v-else-if="evt.type === 'reflect' || evt.type === 'reflect_keep' || evt.type === 'reflect_reject'">🔬</template>
+            <template v-else>·</template>
+          </span>
+          <span class="break-all">{{ eventLabel(evt) }}</span>
+        </div>
+        <div v-if="loading" class="flex items-center gap-6px text-gray-400">
+          <NSpin :size="12" />
+          <span>Agent 运行中…</span>
+        </div>
+      </div>
+    </NCard>
+
     <NCard :bordered="false" size="small" class="sm:flex-1-hidden card-wrapper">
+      <template #header>
+        <NSpace align="center" justify="space-between" class="w-full">
+          <NSpace align="center" :size="8">
+            <span>候选论文</span>
+            <NTag v-if="candidates.length > 0" size="small" :bordered="false">{{ candidates.length }}</NTag>
+          </NSpace>
+          <!-- 历史会话列表 -->
+          <NPopover v-if="sessions.length > 0" placement="bottom-end" trigger="click" :width="320">
+            <template #trigger>
+              <NButton size="small" quaternary>
+                <template #icon><icon-ic-round-history class="text-icon" /></template>
+                历史 ({{ sessions.length }})
+              </NButton>
+            </template>
+            <NSpin :show="sessionLoading">
+              <NList hoverable clickable size="small">
+                <NListItem
+                  v-for="s in sessions"
+                  :key="s.id"
+                  @click="loadSession(s.id, s.query)"
+                >
+                  <div class="flex items-center justify-between gap-8px">
+                    <NEllipsis class="flex-1 text-13px">{{ s.query }}</NEllipsis>
+                    <NSpace :size="4" :wrap="false">
+                      <NTag size="small" :type="s.status === 'COMPLETED' ? 'success' : 'error'" :bordered="false">
+                        {{ s.status === 'COMPLETED' ? '完成' : '失败' }}
+                      </NTag>
+                      <NText class="shrink-0 text-11px text-gray-400">{{ formatTime(s.createdAt) }}</NText>
+                    </NSpace>
+                  </div>
+                </NListItem>
+              </NList>
+            </NSpin>
+          </NPopover>
+        </NSpace>
+      </template>
       <NSpin :show="loading">
         <NEmpty v-if="candidates.length === 0" description="暂无候选结果" class="py-100px" />
         <NScrollbar v-else class="max-h-[calc(100vh-280px)] pr-8px">
@@ -207,7 +438,7 @@ async function importCandidate(candidate: Api.KnowledgeBase.ResearchAgent.Candid
                   type="primary"
                   ghost
                   :loading="importingIds.has(item.id)"
-                  :disabled="item.importStatus === 'IMPORTED'"
+                  :disabled="item.importStatus === 'IMPORTED' || !item.pdfUrl"
                   @click="importCandidate(item)"
                 >
                   <template #icon>

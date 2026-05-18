@@ -134,25 +134,9 @@ const { columns, columnChecks, data, getData, loading } = useTable({
 
 const store = useKnowledgeBaseStore();
 const { tasks } = storeToRefs(store);
-let vectorizationPollingTimer: ReturnType<typeof setInterval> | null = null;
 
 onMounted(async () => {
   await getList();
-  vectorizationPollingTimer = setInterval(() => {
-    const hasRunningVectorization = tasks.value.some(
-      item =>
-        item.status === UploadStatus.Completed &&
-        (item.vectorizationStatus === 'PENDING' || item.vectorizationStatus === 'PROCESSING')
-    );
-    if (hasRunningVectorization) getList();
-  }, 5000);
-});
-
-onUnmounted(() => {
-  if (vectorizationPollingTimer) {
-    clearInterval(vectorizationPollingTimer);
-    vectorizationPollingTimer = null;
-  }
 });
 
 /** 异步获取列表函数 该函数主要用于更新或初始化上传任务列表 它首先调用getData函数获取数据，然后根据获取到的数据状态更新任务列表 */
