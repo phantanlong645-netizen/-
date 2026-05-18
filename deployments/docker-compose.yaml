@@ -144,33 +144,6 @@ services:
       timeout: 10s
       retries: 3
 
-  backend:
-    build:
-      context: ..
-      dockerfile: deployments/Dockerfile
-    container_name: backend
-    restart: always
-    ports:
-      - "8081:8081"
-    depends_on:
-      mysql:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      es:
-        condition: service_healthy
-
-  frontend:
-    build:
-      context: ..
-      dockerfile: deployments/Dockerfile.frontend
-    container_name: frontend
-    restart: always
-    ports:
-      - "80:80"
-    depends_on:
-      - backend
-
 volumes:
   mysql-data:
   redis-data:

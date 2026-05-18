@@ -21,13 +21,21 @@ type Config struct {
 	LLM           LLMConfig           `mapstructure:"llm"`
 	AI            AIConfig            `mapstructure:"ai"`
 	ResearchAgent ResearchAgentConfig `mapstructure:"research_agent"`
+	LightRAG      LightRAGConfig      `mapstructure:"lightrag"`
+}
+
+type LightRAGConfig struct {
+	URL    string `mapstructure:"url"`
+	APIKey string `mapstructure:"api_key"`
+	Enable bool   `mapstructure:"enable"`
 }
 type LLMConfig struct {
-	APIKey     string              `mapstructure:"api_key"`
-	BaseURL    string              `mapstructure:"base_url"`
-	Model      string              `mapstructure:"model"`
-	Generation LLMGenerationConfig `mapstructure:"generation"`
-	Prompt     LLMPromptConfig     `mapstructure:"prompt"`
+	APIKey      string              `mapstructure:"api_key"`
+	BaseURL     string              `mapstructure:"base_url"`
+	Model       string              `mapstructure:"model"`
+	IntentModel string              `mapstructure:"intent_model"`
+	Generation  LLMGenerationConfig `mapstructure:"generation"`
+	Prompt      LLMPromptConfig     `mapstructure:"prompt"`
 }
 
 type LLMGenerationConfig struct {

@@ -12,6 +12,7 @@ import (
 	"RAG-repository/pkg/embedding"
 	"RAG-repository/pkg/es"
 	"RAG-repository/pkg/kafka"
+	"RAG-repository/pkg/lightrag"
 	"RAG-repository/pkg/llm"
 	"RAG-repository/pkg/log"
 	"RAG-repository/pkg/storage"
@@ -85,6 +86,13 @@ func main() {
 		uploadRepo,
 		docVectorRepo,
 	)
+
+	// 如果开启 LightRAG，创建客户端并挂载到 processor（chatService 在 NewChatService 内部自动初始化）。
+	if cfg.LightRAG.Enable {
+		lrClient := lightrag.NewClient(cfg.LightRAG)
+		processor.WithLightRAG(lrClient)
+		log.Infof("[main] LightRAG 已启用, URL: %s", cfg.LightRAG.URL)
+	}
 
 	consumerCount := cfg.Kafka.ConsumerCount
 	if consumerCount <= 0 {

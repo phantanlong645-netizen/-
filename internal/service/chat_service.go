@@ -10,6 +10,8 @@ import (
 	"fmt"
 	// strings 用来高效拼接 prompt、上下文和流式回答。
 	"strings"
+	// sync 用来协调并行检索的 goroutine。
+	"sync"
 	// time 用来记录聊天消息时间，以及发送完成通知时间。
 	"time"
 
@@ -19,6 +21,8 @@ import (
 	"RAG-repository/internal/model"
 	// repository 提供会话历史的 Redis 读写能力。
 	"RAG-repository/internal/repository"
+	// lightrag 是知识图谱检索服务客户端。
+	"RAG-repository/pkg/lightrag"
 	// llm 是大模型客户端抽象，ChatService 通过它调用模型。
 	"RAG-repository/pkg/llm"
 	// log 记录业务日志。
@@ -27,6 +31,16 @@ import (
 	// websocket 是聊天接口使用的长连接协议。
 	"github.com/gorilla/websocket"
 )
+
+// intentResult 是意图分析阶段的结构化输出。
+type intentResult struct {
+	// Intent 是对用户问题意图的一句话概括。
+	Intent string `json:"intent"`
+	// Steps 是解决该问题的思维步骤列表。
+	Steps []string `json:"steps"`
+	// Queries 是每个步骤对应需要检索的知识点。
+	Queries []string `json:"queries"`
+}
 
 // ChatService 定义聊天模块对外暴露的业务能力。
 type ChatService interface {
@@ -42,32 +56,56 @@ type chatService struct {
 	llmClient llm.Client
 	// conversationRepo 负责从 Redis 读取和保存聊天历史。
 	conversationRepo repository.ConversationRepository
+	// lightragClient 是图谱检索客户端，nil 时不启用。
+	lightragClient *lightrag.Client
 }
 
 // NewChatService 创建聊天业务对象，并注入它依赖的搜索服务、LLM 客户端和会话仓储。
+// 若配置中 lightrag.enable=true，会自动初始化 LightRAG 客户端。
 func NewChatService(searchService SearchService, llmClient llm.Client, conversationRepo repository.ConversationRepository) ChatService {
-	// 返回接口类型，外部只依赖 ChatService，不直接依赖 chatService。
-	return &chatService{
-		// 保存搜索服务，用来做 RAG 检索。
-		searchService: searchService,
-		// 保存 LLM 客户端，用来生成答案。
-		llmClient: llmClient,
-		// 保存会话仓储，用来管理历史消息。
+	svc := &chatService{
+		searchService:    searchService,
+		llmClient:        llmClient,
 		conversationRepo: conversationRepo,
 	}
+	if config.Conf.LightRAG.Enable {
+		svc.lightragClient = lightrag.NewClient(config.Conf.LightRAG)
+		log.Infof("[ChatService] LightRAG 已启用, URL: %s", config.Conf.LightRAG.URL)
+	}
+	return svc
 }
 
-// StreamResponse 协调完整 RAG 流程：检索上下文、组装消息、调用 LLM、流式返回、保存历史。
+// StreamResponse 协调完整 RAG 流程：意图分析、并行检索、组装消息、调用 LLM、流式返回、保存历史。
 func (s *chatService) StreamResponse(ctx context.Context, query string, user *model.User, ws *websocket.Conn, shouldStop func() bool) error {
-	// 第一步：用 SearchService 检索知识库，topK=10 表示最多取 10 条相关片段。
-	results, err := s.searchService.HybridSearch(ctx, query, 10, user)
-	// 如果检索失败，后面没有可靠上下文，直接返回错误。
+	// 第一步：意图分析——用轻量模型把用户问题拆解成思维步骤和多个子检索词。
+	intent, err := s.analyzeIntent(ctx, query)
 	if err != nil {
-		return fmt.Errorf("failed to retrieve context: %w", err)
+		// 意图分析失败时降级为原始问题直接检索，不中断整个流程。
+		log.Warnf("[ChatService] 意图分析失败，降级为单次检索: %v", err)
+		intent = &intentResult{Queries: []string{query}}
 	}
+
+	// 把意图分析结果（思维链）推送给前端，让用户看到"正在思考"的过程。
+	sendThinkingEvent(ws, intent)
+
+	// 第二步：并行检索——对每个子查询同时发起知识库召回，汇总去重后作为上下文。
+	results := s.parallelSearch(ctx, intent.Queries, 5, user)
 
 	// 把搜索结果转换成一段可放进 prompt 的参考资料文本。
 	contextText := s.buildContextText(results)
+
+	// 第三步（可选）：若 LightRAG 已启用，补充图谱检索上下文。
+	// LightRAG 的 mix 模式同时用向量检索和知识图谱推理，可以找到 ES 遗漏的实体关系。
+	if s.lightragClient != nil {
+		graphCtx, err := s.lightragClient.QueryContext(ctx, query, "mix")
+		if err != nil {
+			log.Warnf("[ChatService] LightRAG 检索失败，忽略图谱上下文: %v", err)
+		} else if strings.TrimSpace(graphCtx) != "" {
+			contextText = contextText + "\n\n--- 知识图谱补充信息 ---\n" + graphCtx
+			log.Infof("[ChatService] LightRAG 返回图谱上下文，长度: %d 字符", len(graphCtx))
+		}
+	}
+
 	// 根据参考资料文本构造 system message，告诉模型回答规则和参考内容。
 	systemMsg := s.buildSystemMessage(contextText)
 
@@ -133,6 +171,131 @@ func (s *chatService) StreamResponse(ctx context.Context, query string, user *mo
 
 	// 整个 RAG 流程正常结束。
 	return nil
+}
+
+// analyzeIntent 调用轻量 LLM 对用户问题做意图分析，拆解出思维步骤和子检索词列表。
+func (s *chatService) analyzeIntent(ctx context.Context, query string) (*intentResult, error) {
+	// 构造意图分析专用的 system prompt，要求模型以严格 JSON 格式返回。
+	systemPrompt := `你是一个查询分析助手。给定用户问题，请分析：
+1. 用户意图（一句话概括）
+2. 解决这个问题的思维步骤（2-4个步骤）
+3. 每个步骤需要检索的知识点（简洁的检索词）
+
+必须严格以 JSON 格式返回，不要有任何额外文字、代码块标记或注释：
+{"intent":"用户意图","steps":["步骤1","步骤2"],"queries":["检索词1","检索词2"]}`
+
+	// 构造发给意图分析模型的消息列表。
+	messages := []llm.Message{
+		{Role: "system", Content: systemPrompt},
+		{Role: "user", Content: query},
+	}
+
+	// 确定意图分析使用的模型：优先用配置里的 intent_model，没有就退回主模型。
+	intentModel := config.Conf.LLM.IntentModel
+	if intentModel == "" {
+		intentModel = config.Conf.LLM.Model
+	}
+
+	// 构造专用于意图分析的轻量 LLM 配置：低 temperature 保证 JSON 格式稳定。
+	intentCfg := config.LLMConfig{
+		APIKey:  config.Conf.LLM.APIKey,
+		BaseURL: config.Conf.LLM.BaseURL,
+		Model:   intentModel,
+	}
+	intentClient := llm.NewClient(intentCfg)
+
+	// 调用非流式接口，一次性拿到完整 JSON 响应。
+	temp := 0.1
+	maxTok := 512
+	raw, err := intentClient.CompleteChatMessages(ctx, messages, &llm.GenerationParams{
+		Temperature: &temp,
+		MaxTokens:   &maxTok,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("intent analysis LLM call failed: %w", err)
+	}
+
+	log.Infof("[ChatService] 意图分析原始响应: %s", raw)
+
+	// 有时模型会在 JSON 前后附加 markdown 代码块标记，尝试提取其中的 JSON 部分。
+	raw = strings.TrimSpace(raw)
+	if idx := strings.Index(raw, "{"); idx > 0 {
+		raw = raw[idx:]
+	}
+	if idx := strings.LastIndex(raw, "}"); idx >= 0 && idx < len(raw)-1 {
+		raw = raw[:idx+1]
+	}
+
+	// 把 JSON 字符串反序列化成 intentResult。
+	var result intentResult
+	if err := json.Unmarshal([]byte(raw), &result); err != nil {
+		return nil, fmt.Errorf("failed to parse intent JSON: %w", err)
+	}
+
+	// 如果模型没有返回任何 queries，就用原始问题兜底。
+	if len(result.Queries) == 0 {
+		result.Queries = []string{query}
+	}
+
+	log.Infof("[ChatService] 意图分析结果: intent=%s, steps=%d, queries=%v", result.Intent, len(result.Steps), result.Queries)
+	return &result, nil
+}
+
+// parallelSearch 并发对每个子查询执行知识库召回，合并去重后返回结果。
+func (s *chatService) parallelSearch(ctx context.Context, queries []string, topKEach int, user *model.User) []model.SearchResponseDTO {
+	// resultCh 收集所有 goroutine 的检索结果。
+	resultCh := make(chan []model.SearchResponseDTO, len(queries))
+
+	var wg sync.WaitGroup
+	for _, q := range queries {
+		wg.Add(1)
+		go func(q string) {
+			defer wg.Done()
+			res, err := s.searchService.HybridSearch(ctx, q, topKEach, user)
+			if err != nil {
+				log.Warnf("[ChatService] 子查询检索失败 query='%s': %v", q, err)
+				return
+			}
+			resultCh <- res
+		}(q)
+	}
+
+	// 等所有 goroutine 结束后关闭 channel，避免 range 死锁。
+	wg.Wait()
+	close(resultCh)
+
+	// 收集结果并按 TextContent 前缀去重，避免多个子查询命中同一片段。
+	var merged []model.SearchResponseDTO
+	seen := make(map[string]bool)
+	for res := range resultCh {
+		for _, r := range res {
+			// 用文本内容的前 80 字符作为去重 key，平衡精度和性能。
+			key := r.TextContent
+			if len(key) > 80 {
+				key = key[:80]
+			}
+			if !seen[key] {
+				seen[key] = true
+				merged = append(merged, r)
+			}
+		}
+	}
+
+	log.Infof("[ChatService] 并行检索完成: queries=%d, merged=%d 条", len(queries), len(merged))
+	return merged
+}
+
+// sendThinkingEvent 把意图分析结果作为 thinking 事件推送给前端。
+func sendThinkingEvent(ws *websocket.Conn, intent *intentResult) {
+	payload := map[string]interface{}{
+		"type":    "thinking",
+		"intent":  intent.Intent,
+		"steps":   intent.Steps,
+		"queries": intent.Queries,
+	}
+	b, _ := json.Marshal(payload)
+	// 推送失败不影响后续流程，忽略错误。
+	_ = ws.WriteMessage(websocket.TextMessage, b)
 }
 
 // buildContextText 把搜索结果拼成 prompt 中的参考资料区。

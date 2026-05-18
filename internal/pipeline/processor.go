@@ -16,6 +16,7 @@ import (
 	"RAG-repository/internal/repository"
 	"RAG-repository/internal/storagepath"
 	"RAG-repository/pkg/embedding"
+	"RAG-repository/pkg/lightrag"
 	"RAG-repository/pkg/log"
 	"RAG-repository/pkg/storage"
 	"RAG-repository/pkg/tasks"
@@ -49,6 +50,14 @@ type Processor struct {
 	embeddingCfg    config.EmbeddingConfig
 	uploadRepo      repository.UploadRepository
 	docVectorRepo   repository.DocumentVectorRepository
+	lightragClient  *lightrag.Client // 可选，nil 表示不启用
+}
+
+// WithLightRAG 挂载 LightRAG 客户端，文档处理成功后会异步将文本推送给 LightRAG 建图。
+// 使用独立 setter 避免改变 NewProcessor 签名。
+func (p *Processor) WithLightRAG(client *lightrag.Client) *Processor {
+	p.lightragClient = client
+	return p
 }
 
 func NewProcessor(
@@ -171,6 +180,19 @@ func (p *Processor) Process(ctx context.Context, task tasks.FileProcessingTask) 
 
 	if err := p.uploadRepo.UpdateFileVectorizationStatusByMD5AndUserID(task.FileMD5, task.UserID, model.VectorizationStatusCompleted, ""); err != nil {
 		return fmt.Errorf("update vectorization status to completed failed: %w", err)
+	}
+
+	// 将完整文本异步推送给 LightRAG 建立知识图谱。
+	// 使用独立 goroutine，避免 LightRAG 延迟影响主入库流程。
+	if p.lightragClient != nil {
+		go func(text, fileName string) {
+			// 使用新 context，不依赖 Kafka 消费的 context，LightRAG 可自行超时处理。
+			if err := p.lightragClient.InsertText(context.Background(), text, fileName); err != nil {
+				log.Warnf("[Processor] 推送文本到 LightRAG 失败，不影响主流程, FileName: %s, Error: %v", fileName, err)
+			} else {
+				log.Infof("[Processor] 已将文本推送给 LightRAG, FileName: %s", fileName)
+			}
+		}(textContent, task.FileName)
 	}
 
 	return nil
