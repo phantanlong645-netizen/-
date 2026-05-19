@@ -23,3 +23,11 @@ type Conversation struct {
 func (Conversation) TableName() string {
 	return "conversations"
 }
+
+// ConversationSummary stores the compressed long-term memory of a chat session.
+type ConversationSummary struct {
+	Content            string    `json:"content"`
+	UpdatedAt          time.Time `json:"updatedAt"`
+	SourceMessageCount int       `json:"sourceMessageCount"`
+	SourceCharacterLen int       `json:"sourceCharacterLen"`
+}

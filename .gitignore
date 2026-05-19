@@ -1,0 +1,4 @@
+logs/
+server.exe
+config/config.yaml
+config/config.docker.yaml

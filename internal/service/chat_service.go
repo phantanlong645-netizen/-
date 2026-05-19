@@ -170,7 +170,27 @@ func (r *intentResult) flatQueries() []string {
 type ChatService interface {
 	// StreamResponse 执行 RAG 问答，并把 LLM 的流式输出写入 WebSocket。
 	StreamResponse(ctx context.Context, query string, user *model.User, ws *websocket.Conn, shouldStop func() bool) error
+	CompactConversation(ctx context.Context, user *model.User, force bool) (*ConversationCompressionResult, error)
 }
+
+// ConversationCompressionResult is the result of compacting a conversation.
+type ConversationCompressionResult struct {
+	ConversationID        string `json:"conversationId"`
+	Auto                  bool   `json:"auto"`
+	CompressedMessages    int    `json:"compressedMessages"`
+	RecentMessages        int    `json:"recentMessages"`
+	SummaryCharacters     int    `json:"summaryCharacters"`
+	Summary               string `json:"summary"`
+	HistoryMessagesBefore int    `json:"historyMessagesBefore"`
+}
+
+const (
+	conversationCompressionRecentMessages   = 8
+	conversationCompressionAutoThreshold    = 14
+	conversationCompressionMicroMaxChars    = 1200
+	conversationCompressionSummaryMaxChars  = 1800
+	conversationCompressionKeepWarmMessages = 2
+)
 
 // chatService 是 ChatService 的具体实现。
 type chatService struct {
@@ -252,18 +272,31 @@ func (s *chatService) StreamResponse(ctx context.Context, query string, user *mo
 		}
 	}
 
-	// 根据参考资料文本构造 system message，告诉模型回答规则和参考内容。
-	systemMsg := s.buildSystemMessage(contextText)
-
-	// 从 Redis 读取该用户之前的聊天历史。
-	history, err := s.loadHistory(ctx, user.ID)
-	// 历史读取失败不阻断本次问答，只记录日志，然后按无历史继续。
+	// 从 Redis 读取该用户之前的聊天历史和长期摘要。
+	_, summary, history, err := s.loadConversationContext(ctx, user.ID)
+	// 历史读取失败不阻断本次问答，只记录日志，然后按空历史继续。
 	if err != nil {
 		// 记录历史读取失败。
-		log.Errorf("Failed to load conversation history: %v", err)
+		log.Errorf("Failed to load conversation memory: %v", err)
 		// 使用空历史继续构造本轮消息。
 		history = []model.ChatMessage{}
 	}
+
+	if len(history) >= conversationCompressionAutoThreshold {
+		if _, compactErr := s.compactConversationMemory(ctx, user, false); compactErr != nil {
+			log.Warnf("[ChatService] 自动压缩会话失败，继续使用原始历史: %v", compactErr)
+		} else {
+			_, summary, history, err = s.loadConversationContext(ctx, user.ID)
+			if err != nil {
+				log.Warnf("[ChatService] 自动压缩后重新加载会话失败，继续使用原始历史: %v", err)
+				summary = ""
+				history = []model.ChatMessage{}
+			}
+		}
+	}
+
+	// 根据参考资料文本和会话摘要构造 system message。
+	systemMsg := s.buildSystemMessage(contextText, summary)
 
 	// 把 system message、历史消息、当前用户问题组合成 LLM 的 messages。
 	messages := s.composeMessages(systemMsg, history, query)
@@ -554,8 +587,8 @@ func (s *chatService) buildContextText(searchResults []model.SearchResponseDTO) 
 	return contextBuilder.String()
 }
 
-// buildSystemMessage 根据检索上下文构造 system message。
-func (s *chatService) buildSystemMessage(contextText string) string {
+// buildSystemMessage 根据检索上下文和会话摘要构造 system message。
+func (s *chatService) buildSystemMessage(contextText, summary string) string {
 	// 优先读取原项目兼容 Java 风格的 ai.prompt.rules。
 	rules := config.Conf.AI.Prompt.Rules
 	// 如果 ai.prompt.rules 没配置，就回退到 llm.prompt.rules。
@@ -597,6 +630,15 @@ func (s *chatService) buildSystemMessage(contextText string) string {
 	sys.WriteString(refStart)
 	sys.WriteString("\n")
 
+	if strings.TrimSpace(summary) != "" {
+		sys.WriteString("--- 历史反思摘要 ---\n")
+		sys.WriteString(summary)
+		if !strings.HasSuffix(summary, "\n") {
+			sys.WriteString("\n")
+		}
+		sys.WriteString("\n")
+	}
+
 	// 如果有检索上下文，就把检索结果写入参考资料区。
 	if contextText != "" {
 		sys.WriteString(contextText)
@@ -622,30 +664,217 @@ func (s *chatService) buildSystemMessage(contextText string) string {
 	return sys.String()
 }
 
+// loadConversationContext 从 Redis 中加载 conversationID、会话摘要和聊天历史。
+func (s *chatService) loadConversationContext(ctx context.Context, userID uint) (string, string, []model.ChatMessage, error) {
+	conversationID, err := s.conversationRepo.GetOrCreateConversationID(ctx, userID)
+	if err != nil {
+		return "", "", nil, err
+	}
+
+	summary, err := s.conversationRepo.GetConversationSummary(ctx, conversationID)
+	if err != nil {
+		return "", "", nil, err
+	}
+
+	history, err := s.conversationRepo.GetConversationHistory(ctx, conversationID)
+	if err != nil {
+		return "", "", nil, err
+	}
+
+	summaryText := ""
+	if summary != nil {
+		summaryText = summary.Content
+	}
+
+	return conversationID, summaryText, history, nil
+}
+
 // loadHistory 从 Redis 中加载用户聊天历史。
 func (s *chatService) loadHistory(ctx context.Context, userID uint) ([]model.ChatMessage, error) {
-	// 先根据 userID 获取或创建 conversationID。
-	convID, err := s.conversationRepo.GetOrCreateConversationID(ctx, userID)
-	// 如果 Redis 操作失败，直接返回错误。
+	_, _, history, err := s.loadConversationContext(ctx, userID)
+	return history, err
+}
+
+// CompactConversation 手动或自动压缩当前会话记忆。
+func (s *chatService) CompactConversation(ctx context.Context, user *model.User, force bool) (*ConversationCompressionResult, error) {
+	return s.compactConversationMemory(ctx, user, force)
+}
+
+func (s *chatService) compactConversationMemory(ctx context.Context, user *model.User, force bool) (*ConversationCompressionResult, error) {
+	conversationID, existingSummary, history, err := s.loadConversationContext(ctx, user.ID)
 	if err != nil {
 		return nil, err
 	}
 
-	// 根据 conversationID 查询历史消息列表。
-	return s.conversationRepo.GetConversationHistory(ctx, convID)
+	historyBefore := len(history)
+	result := &ConversationCompressionResult{
+		ConversationID:        conversationID,
+		Auto:                  !force,
+		HistoryMessagesBefore: historyBefore,
+		Summary:               existingSummary,
+		SummaryCharacters:     len(existingSummary),
+	}
+
+	if historyBefore == 0 {
+		return result, nil
+	}
+
+	keepRecent := conversationCompressionRecentMessages
+	if force {
+		keepRecent = conversationCompressionKeepWarmMessages
+	}
+	if keepRecent > historyBefore {
+		keepRecent = historyBefore
+	}
+
+	if !force && historyBefore < conversationCompressionAutoThreshold {
+		result.RecentMessages = historyBefore
+		return result, nil
+	}
+
+	compressedCount := historyBefore - keepRecent
+	if compressedCount <= 0 {
+		result.RecentMessages = historyBefore
+		return result, nil
+	}
+
+	compressedMessages := history[:compressedCount]
+	recentMessages := append([]model.ChatMessage(nil), history[compressedCount:]...)
+
+	summaryText, err := s.generateConversationSummary(ctx, existingSummary, compressedMessages)
+	if err != nil {
+		return nil, err
+	}
+
+	if len([]rune(summaryText)) > conversationCompressionSummaryMaxChars {
+		summaryText = clipConversationText(summaryText, conversationCompressionSummaryMaxChars)
+	}
+
+	summaryModel := &model.ConversationSummary{
+		Content:            summaryText,
+		UpdatedAt:          time.Now(),
+		SourceMessageCount: compressedCount,
+		SourceCharacterLen: totalMessageCharacters(compressedMessages),
+	}
+
+	if err := s.conversationRepo.UpdateConversationSummary(ctx, conversationID, summaryModel); err != nil {
+		return nil, err
+	}
+	if err := s.conversationRepo.UpdateConversationHistory(ctx, conversationID, recentMessages); err != nil {
+		return nil, err
+	}
+
+	result.Auto = !force
+	result.CompressedMessages = compressedCount
+	result.RecentMessages = len(recentMessages)
+	result.Summary = summaryText
+	result.SummaryCharacters = len(summaryText)
+	return result, nil
+}
+
+func (s *chatService) generateConversationSummary(ctx context.Context, existingSummary string, messages []model.ChatMessage) (string, error) {
+	if len(messages) == 0 {
+		return strings.TrimSpace(existingSummary), nil
+	}
+
+	var prompt strings.Builder
+	prompt.WriteString("你是会话记忆压缩器。任务是把对话压缩成可长期复用的中文摘要。\n")
+	prompt.WriteString("要求：\n")
+	prompt.WriteString("1. 保留用户长期目标、偏好、约束、决定、未完成事项、关键实体名和数值。\n")
+	prompt.WriteString("2. 删除重复、闲聊、长日志、工具输出和细枝末节。\n")
+	prompt.WriteString("3. 输出纯中文，不要 markdown，不要项目符号，不要解释压缩过程。\n")
+	prompt.WriteString("4. 摘要要短，但不能丢失后续回答会依赖的信息。\n\n")
+
+	if strings.TrimSpace(existingSummary) != "" {
+		prompt.WriteString("已有摘要：\n")
+		prompt.WriteString(existingSummary)
+		prompt.WriteString("\n\n")
+	}
+
+	prompt.WriteString("待压缩消息：\n")
+	for i, message := range messages {
+		content := strings.TrimSpace(message.Content)
+		if content == "" {
+			continue
+		}
+		if len(content) > conversationCompressionMicroMaxChars {
+			content = clipConversationText(content, conversationCompressionMicroMaxChars)
+		}
+		prompt.WriteString(fmt.Sprintf("[%d] %s: %s\n", i+1, message.Role, content))
+	}
+	prompt.WriteString("\n请输出新的会话摘要。")
+
+	messagesForLLM := []llm.Message{
+		{Role: "system", Content: "你是一个严格的中文会话摘要器，只输出摘要正文。"},
+		{Role: "user", Content: prompt.String()},
+	}
+
+	temp := 0.1
+	maxTok := 512
+	raw, err := s.llmClient.CompleteChatMessages(ctx, messagesForLLM, &llm.GenerationParams{
+		Temperature: &temp,
+		MaxTokens:   &maxTok,
+	})
+	if err != nil {
+		return "", fmt.Errorf("generate conversation summary failed: %w", err)
+	}
+
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return strings.TrimSpace(existingSummary), nil
+	}
+	if len([]rune(raw)) > conversationCompressionSummaryMaxChars {
+		raw = clipConversationText(raw, conversationCompressionSummaryMaxChars)
+	}
+	return raw, nil
+}
+
+func totalMessageCharacters(messages []model.ChatMessage) int {
+	total := 0
+	for _, message := range messages {
+		total += len([]rune(message.Content))
+	}
+	return total
+}
+
+func clipConversationText(text string, maxLen int) string {
+	text = strings.TrimSpace(text)
+	if maxLen <= 0 {
+		return text
+	}
+	runes := []rune(text)
+	if len(runes) <= maxLen {
+		return text
+	}
+	head := maxLen * 2 / 3
+	tail := maxLen - head - len([]rune("\n...[已压缩]...\n"))
+	if tail < 0 {
+		tail = 0
+	}
+	if head < 0 {
+		head = 0
+	}
+	if tail == 0 {
+		if head > len(runes) {
+			head = len(runes)
+		}
+		return string(runes[:head]) + "\n...[已压缩]..."
+	}
+	if head+tail > len(runes) {
+		return text
+	}
+	return string(runes[:head]) + "\n...[已压缩]...\n" + string(runes[len(runes)-tail:])
 }
 
 // composeMessages 组装发送给 LLM 的消息列表。
 func (s *chatService) composeMessages(systemMsg string, history []model.ChatMessage, userInput string) []model.ChatMessage {
-	// 预分配容量：system 一条 + 历史消息 + 当前用户问题。
 	msgs := make([]model.ChatMessage, 0, len(history)+2)
-	// 第一条必须是 system message，用来约束模型行为。
 	msgs = append(msgs, model.ChatMessage{Role: "system", Content: systemMsg})
-	// 中间加入历史对话，让模型具备上下文记忆。
-	msgs = append(msgs, history...)
-	// 最后一条加入当前用户问题。
+	for _, message := range history {
+		message.Content = clipConversationText(message.Content, conversationCompressionMicroMaxChars)
+		msgs = append(msgs, message)
+	}
 	msgs = append(msgs, model.ChatMessage{Role: "user", Content: userInput})
-	// 返回完整 messages。
 	return msgs
 }
 

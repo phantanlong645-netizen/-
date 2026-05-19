@@ -1,7 +1,7 @@
-// Package lightrag 封装对 LightRAG REST API 的访问。
-// LightRAG 是一个基于知识图谱的 RAG 服务，通过 HTTP 接口提供：
-//   - 文档插入：/documents/text
-//   - 知识库查询（仅返回上下文）：/query with only_need_context=true
+// Package lightrag wraps access to the LightRAG REST API.
+// LightRAG provides:
+//   - document ingestion: /documents/text
+//   - context-only query: /query with only_need_context=true
 package lightrag
 
 import (
@@ -17,25 +17,25 @@ import (
 	"RAG-repository/pkg/log"
 )
 
-// Client 是 LightRAG HTTP 客户端。
+const lightragRequestTimeout = 30 * time.Second
+
+// Client is a LightRAG HTTP client.
 type Client struct {
 	cfg        config.LightRAGConfig
 	httpClient *http.Client
 }
 
-// NewClient 创建 LightRAG 客户端。
+// NewClient creates a LightRAG client.
 func NewClient(cfg config.LightRAGConfig) *Client {
 	return &Client{
 		cfg: cfg,
 		httpClient: &http.Client{
-			// 插入文档时 LightRAG 异步处理，HTTP 请求本身很快完成。
-			Timeout: 30 * time.Second,
+			Timeout: lightragRequestTimeout,
 		},
 	}
 }
 
-// InsertText 把纯文本内容异步发送给 LightRAG 建立知识图谱。
-// LightRAG 服务器会在后台对文本做实体抽取和关系建图，不阻塞入库流程。
+// InsertText sends plain text to LightRAG for knowledge graph building.
 func (c *Client) InsertText(ctx context.Context, text, description string) error {
 	body := map[string]string{
 		"text":        text,
@@ -44,22 +44,18 @@ func (c *Client) InsertText(ctx context.Context, text, description string) error
 	return c.post(ctx, "/documents/text", body, nil)
 }
 
-// queryRequest 是调用 /query 接口的请求体。
 type queryRequest struct {
 	Query           string `json:"query"`
 	Mode            string `json:"mode"`
 	OnlyNeedContext bool   `json:"only_need_context"`
 }
 
-// queryResponse 是 /query 接口在 only_need_context=true 时的响应结构。
-// 此时 response 字段包含的是 LightRAG 从知识图谱中检索到的上下文文本。
 type queryResponse struct {
 	Response string `json:"response"`
 	Status   string `json:"status,omitempty"`
 }
 
-// QueryContext 向 LightRAG 发起查询，只返回检索上下文，不让 LightRAG 自行生成答案。
-// mode 推荐使用 "mix"（向量 + 图谱混合检索），也可以用 "local"/"global"/"hybrid"/"naive"。
+// QueryContext asks LightRAG for context only.
 func (c *Client) QueryContext(ctx context.Context, query string, mode string) (string, error) {
 	if mode == "" {
 		mode = "mix"
@@ -76,7 +72,6 @@ func (c *Client) QueryContext(ctx context.Context, query string, mode string) (s
 	return resp.Response, nil
 }
 
-// post 是通用的 HTTP POST 帮助函数。
 func (c *Client) post(ctx context.Context, path string, body interface{}, out interface{}) error {
 	reqBytes, err := json.Marshal(body)
 	if err != nil {

@@ -74,8 +74,11 @@ func main() {
 	uploadService := service.NewUploadService(uploadRepo, userRepository, orgTagRepo, cfg.MinIO)
 	documentService := service.NewDocumentService(uploadRepo, userRepository, userService, orgTagRepo, docVectorRepo, cfg.MinIO, cfg.Elasticsearch, tikaClient)
 	searchService := service.NewSearchService(embeddingClient, es.ESClient, userService, uploadRepo)
+	// 初始化对话服务（用于RAG对话）
 	conversationService := service.NewConversationService(conversationRepo)
 	chatService := service.NewChatService(searchService, llmClient, conversationRepo)
+	// 初始化学术检索Agent服务
+	// 依赖注入：研究仓库、组织标签仓库、Agent配置、LLM客户端、文件导入器
 	researchAgentService := service.NewResearchAgentService(researchRepo, orgTagRepo, cfg.ResearchAgent, llmClient, uploadService)
 	processor := pipeline.NewProcessor(
 		tikaClient,
@@ -125,6 +128,7 @@ func main() {
 
 	log.Info("Shutting down server...")
 }
+
 func registerRoutes(
 	r *gin.Engine,
 	userService service.UserService,
@@ -195,21 +199,31 @@ func registerRoutes(
 			search.GET("/hybrid", handler.NewSearchHandler(searchService).HybridSearch)
 		}
 
+		// 学术检索Agent路由组
+		// 提供学术论文检索、会话管理、候选论文列表查询和导入知识库功能
 		researchAgent := apiV1.Group("/research-agent")
-		researchAgent.Use(middleware.AuthMiddleware(jwtManager, userService))
+		researchAgent.Use(middleware.AuthMiddleware(jwtManager, userService)) // 需要JWT认证
 		{
+			// 创建Agent处理器，传入Agent服务和用户服务
 			researchAgentHandler := handler.NewResearchAgentHandler(researchAgentService, userService)
+			// GET /sessions - 查询用户的历史检索会话列表
 			researchAgent.GET("/sessions", researchAgentHandler.ListSessions)
+			// POST /sessions - 发起新的学术论文检索请求（阻塞模式）
 			researchAgent.POST("/sessions", researchAgentHandler.RunSearch)
+			// POST /sessions/stream - 发起新的学术论文检索请求（流式推送进度）
 			researchAgent.POST("/sessions/stream", researchAgentHandler.RunSearchStream)
+			// GET /sessions/:sessionId/candidates - 查询指定会话的候选论文列表
 			researchAgent.GET("/sessions/:sessionId/candidates", researchAgentHandler.ListCandidates)
+			// POST /candidates/:candidateId/import - 将候选论文下载并导入用户的知识库
 			researchAgent.POST("/candidates/:candidateId/import", researchAgentHandler.ImportCandidate)
 		}
 
 		conversation := apiV1.Group("/users/conversation")
 		conversation.Use(middleware.AuthMiddleware(jwtManager, userService))
 		{
-			conversation.GET("", handler.NewConversationHandler(conversationService).GetConversations)
+			conversationHandler := handler.NewConversationHandler(conversationService, chatService, userService)
+			conversation.GET("", conversationHandler.GetConversations)
+			conversation.POST("/compress", conversationHandler.CompressConversation)
 		}
 
 		chatGroup := apiV1.Group("/chat")

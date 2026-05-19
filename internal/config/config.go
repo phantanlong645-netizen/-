@@ -134,10 +134,12 @@ type EmbeddingConfig struct {
 	Dimensions int    `mapstructure:"dimensions"`
 }
 
+// ResearchAgentConfig 学术检索Agent的配置结构体
+// 用于配置各学术数据库API密钥和Agent运行参数
 type ResearchAgentConfig struct {
-	SemanticScholarAPIKey string `mapstructure:"semantic_scholar_api_key"`
-	MaxCandidates         int    `mapstructure:"max_candidates"`
-	MaxIterations         int    `mapstructure:"max_iterations"`
+	SemanticScholarAPIKey string `mapstructure:"semantic_scholar_api_key"` // Semantic Scholar API密钥（可选，有密钥可提高调用限额）
+	MaxCandidates         int    `mapstructure:"max_candidates"`          // Agent单次检索返回的最大候选论文数量上限
+	MaxIterations         int    `mapstructure:"max_iterations"`          // Agent主循环的最大迭代次数，防止无限循环
 }
 
 func Init(configPath string) {

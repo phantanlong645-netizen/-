@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"path/filepath"
 	"regexp"
@@ -14,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"RAG-repository/internal/config"
 	"RAG-repository/internal/model"
@@ -564,6 +566,7 @@ func (s *researchAgentService) toolSearchPapers(ctx context.Context, arguments s
 		Authors         []string `json:"authors"`
 		Year            int      `json:"year"`
 		CitationCount   int      `json:"citation_count"`
+		RelevanceScore  float64  `json:"relevance_score"`
 		Abstract        string   `json:"abstract"`
 		HasPDF          bool     `json:"has_pdf"`
 		AlreadySelected bool     `json:"already_selected,omitempty"`
@@ -581,18 +584,25 @@ func (s *researchAgentService) toolSearchPapers(ctx context.Context, arguments s
 			Authors:         p.Authors,
 			Year:            p.Year,
 			CitationCount:   p.CitationCount,
+			RelevanceScore:  paperRelevanceScore(args.Query, p),
 			Abstract:        truncateString(p.Abstract, 300),
 			HasPDF:          strings.TrimSpace(p.PDFURL) != "",
 			AlreadySelected: isSelected,
 		})
 	}
 	state.mu.Unlock()
-	// 按引用量降序排序，确保 LLM 优先看到影响力高的论文
+	// 按相关性降序排序，确保 LLM 优先看到最贴合 query 的论文
 	sort.Slice(summaries, func(i, j int) bool {
-		if summaries[i].HasPDF != summaries[j].HasPDF {
-			return summaries[i].HasPDF
+		if summaries[i].RelevanceScore != summaries[j].RelevanceScore {
+			return summaries[i].RelevanceScore > summaries[j].RelevanceScore
 		}
-		return summaries[i].CitationCount > summaries[j].CitationCount
+		if summaries[i].CitationCount != summaries[j].CitationCount {
+			return summaries[i].CitationCount > summaries[j].CitationCount
+		}
+		if summaries[i].Year != summaries[j].Year {
+			return summaries[i].Year > summaries[j].Year
+		}
+		return summaries[i].HasPDF && !summaries[j].HasPDF
 	})
 	result, _ := json.Marshal(map[string]interface{}{
 		"count":  len(summaries),
@@ -620,10 +630,6 @@ func toolSelectPaper(arguments string, state *agentState, limit int) string {
 		count := len(state.selectedIDs)
 		state.mu.Unlock()
 		return fmt.Sprintf(`{"status":"already_selected","selected_count":%d,"target":%d}`, count, limit)
-	}
-	if strings.TrimSpace(paper.PDFURL) == "" {
-		state.mu.Unlock()
-		return `{"error":"paper has no pdf_url; select only papers with has_pdf=true"}`
 	}
 	state.selectedIDs = append(state.selectedIDs, args.PaperID)
 	state.selectedReasons[args.PaperID] = args.Reason
@@ -754,10 +760,11 @@ func buildAgentSystemPrompt(limit int) string {
 6. 达到目标数量（约 %d 篇）或已充分搜索时，调用 finish
 
 选择标准：
-- 优先选择与研究问题高度相关的论文
-- 优先选择引用次数多的高影响力论文
-- 必须选择 has_pdf=true 的论文；has_pdf=false 的论文禁止调用 select_paper
-- 覆盖研究问题的不同角度和子主题`, limit)
+	- 优先选择与研究问题最贴合的论文
+	- 优先选择引用次数多的高影响力论文
+	- PDF 只是下载和导入的便利条件，不是 select_paper 的硬约束
+	- 没有 PDF 的论文也可以选择，只要它最贴合 query
+	- 覆盖研究问题的不同角度和子主题`, limit)
 }
 
 // runReflectionAgent 是独立的 Critic Subagent：用一次 LLM 调用对主 Agent 选中的论文逐篇
@@ -794,7 +801,7 @@ func (s *researchAgentService) runReflectionAgent(ctx context.Context, query str
 
 	systemPrompt := `你是学术论文相关性审核 Agent（Critic）。给定研究问题和候选论文列表，对每篇论文独立判断是否与研究问题真正相关。
 严格标准：主题偏离、仅边缘相关或内容过于宽泛的论文应拒绝。
-只保留 has_pdf=true 的论文；has_pdf=false 必须 keep=false。
+has_pdf 只是参考信息，不是硬约束。只要论文与研究问题真正相关，即使没有 PDF 也可以 keep=true。
 只输出 JSON 数组，格式：[{"paper_id":"...","keep":true,"reason":"..."}]，不要任何其他内容。`
 	userMsg := fmt.Sprintf("研究问题：%s\n\n候选论文：%s", query, string(papersJSON))
 
@@ -930,6 +937,54 @@ func truncateString(s string, maxLen int) string {
 		return s
 	}
 	return string(runes[:maxLen]) + "..."
+}
+
+func paperRelevanceScore(query string, paper research.Paper) float64 {
+	q := strings.ToLower(strings.TrimSpace(query))
+	if q == "" {
+		return 0
+	}
+
+	title := strings.ToLower(strings.TrimSpace(paper.Title))
+	abstract := strings.ToLower(strings.TrimSpace(paper.Abstract))
+
+	score := 0.0
+	if title == q {
+		score += 80
+	}
+	if strings.Contains(title, q) {
+		score += 60
+	}
+	if strings.Contains(abstract, q) {
+		score += 20
+	}
+
+	for _, term := range splitQueryTerms(q) {
+		if term == "" {
+			continue
+		}
+		if strings.Contains(title, term) {
+			score += 8
+		}
+		if strings.Contains(abstract, term) {
+			score += 2
+		}
+	}
+
+	return score + math.Log1p(float64(maxInt(paper.CitationCount, 0)))
+}
+
+func splitQueryTerms(q string) []string {
+	return strings.FieldsFunc(q, func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+	})
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 // loadCandidateContent 下载候选论文的内容
